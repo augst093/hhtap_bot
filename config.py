@@ -62,11 +62,13 @@ class Config:
         return user_id in self.admin_ids
 
     def has_google_api_key(self) -> bool:
-        """Проверяет, задан ли валидный ключ Google API."""
-        return bool(
-            self.google_api_key
-            and self.google_api_key != "your_google_places_api_key_here"
-        )
+        """
+        Проверяет, задан ли реальный ключ Google API.
+        Официальные ключи Google API всегда начинаются с 'AIza'.
+        """
+        key = self.google_api_key.strip()
+        return bool(key and key.startswith("AIza") and key != "your_google_places_api_key_here")
+
 
     def validate(self) -> None:
         """Базовая валидация наличия обязательных ключей."""
