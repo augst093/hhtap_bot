@@ -61,15 +61,20 @@ class Config:
             return True
         return user_id in self.admin_ids
 
+    def has_google_api_key(self) -> bool:
+        """Проверяет, задан ли валидный ключ Google API."""
+        return bool(
+            self.google_api_key
+            and self.google_api_key != "your_google_places_api_key_here"
+        )
+
     def validate(self) -> None:
         """Базовая валидация наличия обязательных ключей."""
-        errors = []
         if not self.telegram_bot_token or self.telegram_bot_token == "your_telegram_bot_token_here":
-            errors.append("Не задан TELEGRAM_BOT_TOKEN в файле .env")
-        if not self.google_api_key or self.google_api_key == "your_google_places_api_key_here":
-            errors.append("Не задан GOOGLE_API_KEY в файле .env")
-        if errors:
-            logger.warning("Конфигурация не завершена: %s", "; ".join(errors))
+            logger.warning("Не задан TELEGRAM_BOT_TOKEN в файле .env")
+        if not self.has_google_api_key():
+            logger.info("GOOGLE_API_KEY не задан. Бот будет работать в автономном бесплатном режиме (без ключей и карт).")
+
 
 
 config = Config()

@@ -25,6 +25,7 @@ from services.google_places import (
     ZeroResultsError,
     google_places_service,
 )
+from services.keyless_places import keyless_places_service
 
 # Настройка логирования
 logging.basicConfig(
@@ -57,7 +58,7 @@ def format_place_card(place: PlaceInfo) -> str:
         if place.user_ratings_total is not None:
             rating_part += f" | {place.user_ratings_total} отзывов"
     else:
-        rating_part = "⭐️ Нет оценок"
+        rating_part = "⭐️ Точка найдена"
 
     card = (
         f"🏢 <b>{place.name}</b> ({rating_part})\n"
@@ -81,6 +82,36 @@ def make_place_keyboard(place: PlaceInfo) -> InlineKeyboardMarkup:
         ]
     )
     return keyboard
+
+
+# ==============================================================================
+# Универсальные функции поиска (Официальный API или Автономный режим)
+# ==============================================================================
+async def resolve_search_text(query: str, max_results: int = 3) -> List[PlaceInfo]:
+    """Выполняет поиск через официальный API или автономный бесплатный сервис."""
+    if config.has_google_api_key():
+        return await google_places_service.search_text(query, max_results=max_results)
+    return await keyless_places_service.search_text(query, max_results=max_results)
+
+
+async def resolve_search_by_url(url: str) -> List[PlaceInfo]:
+    """Разворачивает ссылку через официальный API или автономный сервис."""
+    if config.has_google_api_key():
+        return await google_places_service.search_by_url(url)
+    return await keyless_places_service.search_by_url(url)
+
+
+async def resolve_search_nearby(
+    lat: float, lng: float, radius: int = 200, keyword: Optional[str] = None
+) -> List[PlaceInfo]:
+    """Поиск по координатам."""
+    if config.has_google_api_key():
+        return await google_places_service.search_nearby(
+            lat=lat, lng=lng, radius=radius, keyword=keyword
+        )
+    # В автономном режиме ищем по ключевому слову или координатам
+    query = keyword if keyword else f"{lat},{lng}"
+    return await keyless_places_service.search_text(query)
 
 
 # ==============================================================================
@@ -115,10 +146,17 @@ async def admin_whitelist_middleware(handler, event: Message, data):
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     """Приветственное сообщение и инструкция по работе с ботом."""
+    mode_desc = (
+        "🟢 <b>Режим работы:</b> Google Places API"
+        if config.has_google_api_key()
+        else "🟢 <b>Режим работы:</b> Автономный бесплатный (без API-ключей и карт)"
+    )
+
     text = (
         "👋 <b>Добро пожаловать в бота HHtap!</b>\n\n"
         "Я генерирую прямые ссылки на <b>Google Maps (5 звёзд)</b> "
         "для быстрой записи на NFC-карты и стенды через приложение <b>NFC Tools</b>.\n\n"
+        f"{mode_desc}\n\n"
         "<b>Как со мной работать:</b>\n"
         "1️⃣ <b>Сценарий А (Текст):</b> Отправьте название заведения и ориентир/улицу:\n"
         "   👉 <i>Roni Тараса Шевченко Ташкент</i>\n"
@@ -126,7 +164,7 @@ async def cmd_start(message: Message):
         "2️⃣ <b>Сценарий Б (Ссылка):</b> Отправьте короткую ссылку из Google Maps:\n"
         "   👉 <code>https://maps.app.goo.gl/...</code>\n\n"
         "3️⃣ <b>Сценарий В (Геолокация):</b> Нажмите 📎 ➔ <b>Геопозиция</b>, "
-        "и бот найдет заведения в радиусе 200 метров вокруг вас.\n\n"
+        "и бот найдет заведения рядом с вами.\n\n"
         "💡 <i>Сгенерированная ссылка открывает окно оценки 5 звезд в 1 клик!</i>"
     )
     await message.answer(text, parse_mode=ParseMode.HTML)
@@ -169,7 +207,7 @@ async def cmd_id(message: Message):
 @router.message(F.location)
 async def handle_location(message: Message):
     """
-    Поиск заведений рядом с переданной геопозицией (радиус 200 метров).
+    Поиск заведений рядом с переданной геопозицией.
     """
     loc = message.location
     lat, lng = loc.latitude, loc.longitude
@@ -179,50 +217,24 @@ async def handle_location(message: Message):
 
     async with ChatActionSender.find_location(bot=message.bot, chat_id=message.chat.id):
         try:
-            places = await google_places_service.search_nearby(
+            places = await resolve_search_nearby(
                 lat=lat,
                 lng=lng,
                 radius=200,
                 keyword=caption if caption else None,
-                max_results=3,
             )
-
-            if not places:
-                # Если в радиусе 200м ничего не найдено, пробуем расширить до 500м
-                places = await google_places_service.search_nearby(
-                    lat=lat,
-                    lng=lng,
-                    radius=500,
-                    keyword=caption if caption else None,
-                    max_results=3,
-                )
 
             if not places:
                 await message.reply(
                     "📍 <b>Поблизости заведений не найдено</b>\n\n"
-                    "В радиусе 200–500 метров от указанной точки заведения Google Maps не обнаружены. "
+                    "В радиусе от указанной точки заведения Google Maps не обнаружены. "
                     "Попробуйте отправить текстовое название заведения.",
                     parse_mode=ParseMode.HTML,
                 )
                 return
 
-            await send_places_results(message, places, header="📍 <b>Ближайшие заведения (до 200–500м):</b>")
+            await send_places_results(message, places, header="📍 <b>Ближайшие заведения:</b>")
 
-        except RequestDeniedError as e:
-            await message.reply(
-                f"⚠️ <b>Ошибка доступа Google Places API</b>\n\n"
-                f"Запрос отклонен (REQUEST_DENIED).\n"
-                f"Проверьте, что <code>GOOGLE_API_KEY</code> указан корректно и в Google Cloud Console "
-                f"включен <b>Places API</b>.\n\n"
-                f"<i>Детали: {e.message}</i>",
-                parse_mode=ParseMode.HTML,
-            )
-        except QuotaExceededError:
-            await message.reply(
-                "⚠️ <b>Превышен лимит запросов Google API</b>\n\n"
-                "Пожалуйста, подождите немного и повторите попытку.",
-                parse_mode=ParseMode.HTML,
-            )
         except Exception as e:
             logger.exception("Ошибка при поиске по локации: %s", e)
             await message.reply(
@@ -245,7 +257,6 @@ async def handle_text_message(message: Message):
     if not text:
         return
 
-    # Проверяем, есть ли в сообщении ссылка Google Maps
     url_match = MAPS_URL_REGEX.search(text)
 
     async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
@@ -257,12 +268,12 @@ async def handle_text_message(message: Message):
                 found_url = url_match.group(0).strip()
                 logger.info("Обрабатываем ссылку Google Maps: %s", found_url)
 
-                places = await google_places_service.search_by_url(found_url)
+                places = await resolve_search_by_url(found_url)
                 if not places:
                     await message.reply(
                         "🔍 <b>Заведение не найдено</b>\n\n"
-                        "Не удалось сопоставить ссылку с объектом в базе Google Places. "
-                        "Попробуйте написать текстовое название заведения и улицу.",
+                        "Не удалось извлечь точный Place ID по этой ссылке. "
+                        "Попробуйте отправить текстовое название заведения и улицу/город.",
                         parse_mode=ParseMode.HTML,
                     )
                     return
@@ -278,7 +289,7 @@ async def handle_text_message(message: Message):
                 # Сценарий А: Текстовый поиск
                 # --------------------------------------------------------------
                 logger.info("Текстовый поиск: '%s'", text)
-                places = await google_places_service.search_text(query=text, max_results=3)
+                places = await resolve_search_text(query=text, max_results=3)
 
                 if not places:
                     await message.reply(
@@ -311,24 +322,19 @@ async def handle_text_message(message: Message):
             await message.reply(
                 f"⚠️ <b>Ошибка доступа Google Places API</b>\n\n"
                 f"Google API отклонил запрос (<code>REQUEST_DENIED</code>).\n\n"
-                f"<b>Что проверить:</b>\n"
-                f"1. Правильность <code>GOOGLE_API_KEY</code> в файле <code>.env</code>.\n"
-                f"2. В Google Cloud Console включены <b>Places API</b> и/или <b>Places API (New)</b>.\n"
-                f"3. Ключ не ограничен по IP-адресу сервера деплоя.\n"
-                f"4. К аккаунту привязан платежный аккаунт (Billing Account).\n\n"
                 f"<i>Сообщение от Google: {e.message}</i>",
                 parse_mode=ParseMode.HTML,
             )
         except QuotaExceededError:
             await message.reply(
-                "⚠️ <b>Превышен лимит запросов Google API</b>\n\n"
-                "Квота запросов исчерпана. Повторите попытку позже.",
+                "⚠️ <b>Превышен лимит запросов</b>\n\n"
+                "Повторите попытку через пару минут.",
                 parse_mode=ParseMode.HTML,
             )
         except GooglePlacesError as e:
             logger.error("Ошибка GooglePlacesError: %s", e)
             await message.reply(
-                f"⚠️ <b>Ошибка Google Places API:</b>\n<code>{e.message}</code>",
+                f"⚠️ <b>Ошибка сервиса:</b>\n<code>{e.message}</code>",
                 parse_mode=ParseMode.HTML,
             )
         except Exception as e:
@@ -369,7 +375,6 @@ async def send_places_results(
 # Точка входа
 # ==============================================================================
 async def main():
-    # Проверка конфигурации
     config.validate()
 
     if not config.telegram_bot_token or config.telegram_bot_token == "your_telegram_bot_token_here":
@@ -384,6 +389,11 @@ async def main():
     else:
         logger.info("Белый список пуст. Бот доступен всем пользователям.")
 
+    if config.has_google_api_key():
+        logger.info("Режим работы: Официальный Google Places API.")
+    else:
+        logger.info("Режим работы: Автономный БЕСПЛАТНЫЙ режим (без Google API ключей и без карт).")
+
     bot = Bot(
         token=config.telegram_bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -392,15 +402,15 @@ async def main():
     dp.include_router(router)
 
     try:
-        # Удаляем вебхуки и пропускаем накопившиеся апдейты
         await bot.delete_webhook(drop_pending_updates=True)
         logger.info("Бот успешно запущен и готов к работе в Telegram!")
         await dp.start_polling(bot)
     except asyncio.CancelledError:
         logger.info("Остановка бота по сигналу...")
     finally:
+        await keyless_places_service.close()
         await bot.session.close()
-        logger.info("Сессия бота закрыта.")
+        logger.info("Все сессии и ресурсы закрыты.")
 
 
 if __name__ == "__main__":
