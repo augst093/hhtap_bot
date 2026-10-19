@@ -128,6 +128,8 @@ class AISalesService:
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "HHtapBot/1.0",
         }
 
         payload = {
@@ -141,21 +143,27 @@ class AISalesService:
         }
 
         logger.info(
-            "Отправка запроса в Anymodel.org (%s), action=%s, venue='%s'",
+            "Отправка запроса в Anymodel.org (%s), action=%s, venue='%s', endpoint=%s",
             model,
             action,
             name,
+            endpoint,
         )
 
-        async with httpx.AsyncClient(timeout=45.0) as client:
+        timeout_config = httpx.Timeout(90.0, connect=20.0)
+        async with httpx.AsyncClient(timeout=timeout_config) as client:
             try:
                 response = await client.post(endpoint, headers=headers, json=payload)
             except httpx.TimeoutException:
-                logger.error("Таймаут запроса к Anymodel API (%s)", endpoint)
-                raise AISalesError("Превышено время ожидания ответа от Anymodel.org. Попробуйте снова.")
+                logger.error("Таймаут запроса к Anymodel API (%s, модель %s)", endpoint, model)
+                raise AISalesError(
+                    f"Сервер Anymodel.org долго отвечает для модели '{model}'.\n"
+                    "Попробуйте нажать кнопку еще раз через пару секунд."
+                )
             except Exception as e:
                 logger.error("Сетевая ошибка при запросе к Anymodel API: %s", e)
                 raise AISalesError(f"Сетевая ошибка подключения к Anymodel API: {e}")
+
 
         if response.status_code == 401:
             raise AISalesError("Ошибка авторизации Anymodel.org (401): неверный ANYMODEL_API_KEY.")
