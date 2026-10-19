@@ -15,7 +15,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
+    ReplyKeyboardMarkup,
 )
 from aiogram.utils.chat_action import ChatActionSender
 
@@ -31,6 +33,12 @@ from services.google_places import (
     google_places_service,
 )
 from services.keyless_places import keyless_places_service
+from services.lead_hunter import (
+    HUNT_DISTRICTS,
+    HUNT_NICHES,
+    ScoredLead,
+    lead_hunter_service,
+)
 
 # Настройка логирования
 logging.basicConfig(
@@ -57,6 +65,12 @@ OBJECTION_TITLES = {
     "obj_price": "Дорого / Не актуально",
     "obj_think": "Скиньте КП, мы подумаем",
 }
+
+# Тексты кнопок нижнего меню
+BTN_HUNT_MENU = "🎯 Автопоиск ТОП-лидов"
+BTN_QUICK_RAID = "🔥 Быстрый рейд (Топ-5)"
+BTN_STATS = "📊 База и критерии"
+BTN_RESET_SEEN = "🔄 Сбросить просмотренные"
 
 
 # ==============================================================================
@@ -87,8 +101,7 @@ def cache_place(place: PlaceInfo) -> str:
         reviews_count=place.user_ratings_total,
         review_link=place.review_url,
     )
-    # Ограничение размера кэша для предотвращения утечки памяти
-    if len(place_cache) > 1000:
+    if len(place_cache) > 1500:
         oldest_key = next(iter(place_cache))
         del place_cache[oldest_key]
     return short_id
@@ -97,11 +110,120 @@ def cache_place(place: PlaceInfo) -> str:
 # ==============================================================================
 # Клавиатуры и карточки
 # ==============================================================================
+def make_main_reply_keyboard() -> ReplyKeyboardMarkup:
+    """Постоянное нижнее меню для запуска Автопоиска лидов в 1 клик."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text=BTN_HUNT_MENU),
+                KeyboardButton(text=BTN_QUICK_RAID),
+            ],
+            [
+                KeyboardButton(text=BTN_STATS),
+                KeyboardButton(text=BTN_RESET_SEEN),
+            ],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def make_hunt_niche_keyboard() -> InlineKeyboardMarkup:
+    """Шаг 1 Автопоиска: выбор ниши."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🍽 Рестораны и Стейк-хаусы", callback_data="hunt:niche:rest"),
+                InlineKeyboardButton(text="🍸 Бары и Лаунжи", callback_data="hunt:niche:bar"),
+            ],
+            [
+                InlineKeyboardButton(text="☕️ Кофейни и Пекарни", callback_data="hunt:niche:coffee"),
+                InlineKeyboardButton(text="🦷 Клиники и Стоматологии", callback_data="hunt:niche:clinic"),
+            ],
+            [
+                InlineKeyboardButton(text="💈 Барбершопы и Салоны", callback_data="hunt:niche:beauty"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🔥 Все топовые ниши сразу (Авто-микс)",
+                    callback_data="hunt:niche:all",
+                )
+            ],
+        ]
+    )
+
+
+def make_hunt_district_keyboard(niche_key: str) -> InlineKeyboardMarkup:
+    """Шаг 2 Автопоиска: выбор района / денежных улиц Ташкента."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🚀 Весь Ташкент (Самые денежные улицы)",
+                    callback_data=f"hunt:run:{niche_key}:auto",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🏙 Мирабад (Т. Шевченко / Ойбек / Шахрисабз)",
+                    callback_data=f"hunt:run:{niche_key}:mirabad",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🏛 Яккасарай (Ш. Руставели / Бабура / Seoul Mun)",
+                    callback_data=f"hunt:run:{niche_key}:yakkasaray",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🌳 Юнусабад (Ц-4 / Ц-5 / Амир Темур)",
+                    callback_data=f"hunt:run:{niche_key}:yunusabad",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="✨ Мирзо-Улугбек (Ц-1 / Паркентская)",
+                    callback_data=f"hunt:run:{niche_key}:mirzo",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎡 Tashkent City / Центр / Чиланзар",
+                    callback_data=f"hunt:run:{niche_key}:center",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад к выбору ниши",
+                    callback_data="hunt:menu",
+                )
+            ],
+        ]
+    )
+
+
+def make_hunt_more_keyboard(niche_key: str, district_key: str) -> InlineKeyboardMarkup:
+    """Кнопки под пачкой найденных лидов для продолжения охоты."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔥 Найти ещё 5 горячих лидов в этом секторе",
+                    callback_data=f"hunt:run:{niche_key}:{district_key}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧭 Сменить нишу или район",
+                    callback_data="hunt:menu",
+                )
+            ],
+        ]
+    )
+
+
 def format_place_card(place: PlaceInfo) -> str:
-    """
-    Форматирует карточку заведения в соответствии с требованиями HHtap.
-    Ссылка обернута в <code>...</code> для моментального копирования по тапу.
-    """
+    """Форматирует стандартную карточку заведения."""
     rating_part = ""
     if place.rating is not None:
         rating_part = f"⭐️ {place.rating:.1f}"
@@ -111,12 +233,35 @@ def format_place_card(place: PlaceInfo) -> str:
         rating_part = "⭐️ Точка найдена"
 
     card = (
-        f"🏢 <b>{place.name}</b> ({rating_part})\n"
-        f"📍 <i>{place.address}</i>\n\n"
+        f"🏢 <b>{html.escape(place.name)}</b> ({rating_part})\n"
+        f"📍 <i>{html.escape(place.address)}</i>\n\n"
         f"🔗 <b>Ссылка для NFC Tools (тапни для копирования):</b>\n"
         f"<code>{place.review_url}</code>"
     )
     return card
+
+
+def format_scored_lead_card(lead: ScoredLead, rank: int) -> str:
+    """
+    Форматирует обогащённую карточку горячего лида из Автопоиска
+    с индексом потенциала (Score), категорией боли и расчётом нужных 5⭐️ отзывов.
+    """
+    place = lead.place
+    if place.rating is not None:
+        rating_part = f"⭐️ {place.rating:.1f}"
+        if place.user_ratings_total is not None:
+            rating_part += f" | {place.user_ratings_total} отзывов"
+    else:
+        rating_part = "⭐️ Мало оценок"
+
+    return (
+        f"🏆 <b>ТОП-{rank} | Потенциал: {lead.score}/100</b> — {html.escape(lead.tier_badge)}\n"
+        f"🏢 <b>{html.escape(place.name)}</b> ({rating_part})\n"
+        f"📍 <i>{html.escape(place.address)}</i>\n\n"
+        f"💡 <b>Почему купят:</b> {html.escape(lead.why_hot)}\n\n"
+        f"🔗 <b>Ссылка для NFC Tools (тапни для копирования):</b>\n"
+        f"<code>{place.review_url}</code>"
+    )
 
 
 def make_place_keyboard(place: PlaceInfo) -> InlineKeyboardMarkup:
@@ -285,15 +430,15 @@ async def admin_whitelist_callback_middleware(handler, event: CallbackQuery, dat
 
 
 # ==============================================================================
-# Команды бота
+# Команды бота и Автопоиск ТОП-лидов
 # ==============================================================================
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    """Приветственное сообщение и инструкция по работе с ботом."""
+    """Приветственное сообщение, нижняя клавиатура и меню Автопоиска."""
     mode_desc = (
         "🟢 <b>Режим парсера:</b> Google Places API"
         if config.has_google_api_key()
-        else "🟢 <b>Режим парсера:</b> Автономный бесплатный (без API-ключей и карт)"
+        else "🟢 <b>Режим парсера:</b> Автономный SDK-парсер (с рейтингами и отзывами, без ключей)"
     )
     ai_desc = (
         f"🤖 <b>ИИ-ассистент:</b> Подключен ({config.anymodel_model})"
@@ -302,23 +447,195 @@ async def cmd_start(message: Message):
     )
 
     text = (
-        "👋 <b>Добро пожаловать в бота HHtap!</b>\n\n"
-        "Я генерирую прямые ссылки на <b>Google Maps (5 звёзд)</b> "
-        "для быстрой записи на NFC-карты и создаю <b>персонализированные B2B-сообщения</b> "
-        "для продаж владельцам заведений.\n\n"
+        "👋 <b>Добро пожаловать в комбайн лидогенерации HHtap!</b>\n\n"
         f"{mode_desc}\n"
         f"{ai_desc}\n\n"
-        "<b>Как со мной работать:</b>\n"
-        "1️⃣ <b>Сценарий А (Текст):</b> Отправьте название заведения и ориентир/улицу:\n"
-        "   👉 <i>Roni Тараса Шевченко Ташкент</i>\n"
-        "   👉 <i>Black Star Burger Шахрисабз</i>\n\n"
-        "2️⃣ <b>Сценарий Б (Ссылка):</b> Отправьте короткую ссылку из Google Maps:\n"
-        "   👉 <code>https://maps.app.goo.gl/...</code>\n\n"
-        "3️⃣ <b>Сценарий В (Геолокация):</b> Нажмите 📎 ➔ <b>Геопозиция</b>, "
-        "и бот найдет заведения рядом с вами.\n\n"
-        "⚡️ <i>Под каждой найденной точкой доступны кнопки ИИ для генерации питчей под Instagram, Telegram и отработки возражений!</i>"
+        "🎯 <b>ГЛАВНАЯ ФИЧА — Автопоиск ТОП-лидов:</b>\n"
+        "Нажмите кнопку <b>«🎯 Автопоиск ТОП-лидов»</b> или <b>«🔥 Быстрый рейд»</b> внизу экрана — "
+        "бот сам просканирует улицы Ташкента, посчитает математику рейтинга и выдаст 5 самых горячих заведений "
+        "(где просел рейтинг или мало отзывов), которым NFC-карта нужна прямо сейчас.\n\n"
+        "🔎 <b>Ручной режим также работает:</b>\n"
+        "• Отправьте название и улицу (<i>Жигули Бар Ташкент</i>)\n"
+        "• Или ссылку из Google Maps (<code>https://maps.app.goo.gl/...</code>)\n"
+        "• Или геопозицию 📎"
     )
-    await message.answer(text, parse_mode=ParseMode.HTML)
+    await message.answer(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=make_main_reply_keyboard(),
+    )
+
+
+@router.message(Command("hunt"))
+@router.message(F.text == BTN_HUNT_MENU)
+async def cmd_hunt_menu(message: Message):
+    """Открывает интерактивное меню выбора ниши для Автопоиска ТОП-лидов."""
+    seen = lead_hunter_service.seen_count()
+    text = (
+        "🎯 <b>Автопоиск самых горячих лидов HHtap</b>\n\n"
+        "Бот просканирует карточки заведений в Гугл Картах, отсеет столовые/магазины и уже просмотренные точки "
+        f"(в базе просмотренных сейчас: <b>{seen}</b>) и отберёт <b>ТОП-5 клиентов</b> по двум главным критериям:\n"
+        "1️⃣ <b>Острая боль (3.5–4.4⭐️):</b> старые оценки тянут точку вниз, нужно срочно перекрыть пятёрками.\n"
+        "2️⃣ <b>Огромный потенциал (4.5–5.0⭐️, но мало отзывов):</b> сильное место с полупустой карточкой.\n\n"
+        "👇 <b>Выберите нишу заведений:</b>"
+    )
+    await message.answer(
+        text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=make_hunt_niche_keyboard(),
+    )
+
+
+@router.message(F.text == BTN_QUICK_RAID)
+async def handle_quick_raid(message: Message):
+    """Мгновенный запуск поиска ТОП-5 лидов по всем денежным улицам Ташкента в 1 клик."""
+    await execute_lead_hunt(message, niche_key="all", district_key="auto")
+
+
+@router.message(F.text == BTN_STATS)
+async def handle_stats_info(message: Message):
+    """Показывает статистику базы и логику скоринга."""
+    seen = lead_hunter_service.seen_count()
+    text = (
+        "📊 <b>Статистика и алгоритм оценки лидов HHtap</b>\n\n"
+        f"🗂 <b>Уже обработано (в анти-дубль базе):</b> <code>{seen}</code> заведений.\n\n"
+        "🧠 <b>Как бот считает Потенциал (0–99 баллов):</b>\n"
+        "• <b>90–99 баллов (🔥 Острая боль):</b> рейтинг <code>3.5–4.4⭐️</code> при <code>10–180</code> отзывах. "
+        "Бот по точной формуле считает, сколько именно 5⭐️ оценок им не хватает до <code>4.5⭐️</code>, и переводит это в количество рабочих смен с NFC-картой.\n"
+        "• <b>85–97 баллов (🚀 Высокий потенциал, мало отзывов):</b> рейтинг <code>4.5–5.0⭐️</code>, но меньше <code>65</code> отзывов. "
+        "Владелец вложился в продукт, гости довольны, но карточка проигрывает соседям по числу оценок.\n"
+        "• <b>75–84 балла (💎 Борьба за ТОП):</b> крепкие точки с <code>66–220</code> отзывами, которым нужно обогнать лидеров своей улицы без QR-наклеек.\n"
+        "• <b>Авто-фильтр мусора:</b> столовые, хот-доги, магазины, аптеки, госучреждения и гиганты с <code>450+</code> отзывами отсекаются автоматически."
+    )
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=make_main_reply_keyboard())
+
+
+@router.message(F.text == BTN_RESET_SEEN)
+async def handle_reset_seen(message: Message):
+    """Очищает базу просмотренных заведений."""
+    cleared = lead_hunter_service.reset_seen()
+    await message.answer(
+        f"🔄 <b>История просмотренных лидов очищена!</b>\n"
+        f"Удалено записей из фильтра повторов: <code>{cleared}</code>.\n"
+        f"Теперь все заведения Ташкента снова доступны для выдачи.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=make_main_reply_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("hunt:"))
+async def handle_hunt_callbacks(callback: CallbackQuery):
+    """Обрабатывает навигацию по меню Автопоиска и запуск сканирования."""
+    parts = callback.data.split(":")
+    action = parts[1] if len(parts) > 1 else "menu"
+
+    if action == "menu":
+        seen = lead_hunter_service.seen_count()
+        text = (
+            "🎯 <b>Автопоиск самых горячих лидов HHtap</b>\n"
+            f"<i>В базе просмотренных: {seen} точек</i>\n\n"
+            "👇 <b>Выберите нишу заведений:</b>"
+        )
+        await callback.message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=make_hunt_niche_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    if action == "niche" and len(parts) >= 3:
+        niche_key = parts[2]
+        niche_info = HUNT_NICHES.get(niche_key, HUNT_NICHES["all"])
+        text = (
+            f"🎯 <b>Выбрана ниша:</b> {niche_info['title']}\n\n"
+            "👇 <b>Выберите район или денежную зону Ташкента:</b>"
+        )
+        await callback.message.edit_text(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=make_hunt_district_keyboard(niche_key),
+        )
+        await callback.answer()
+        return
+
+    if action == "run" and len(parts) >= 4:
+        niche_key = parts[2]
+        district_key = parts[3]
+        await callback.answer("🕵️‍♂️ Запускаю сканирование карт и отбор ТОП-лидов...")
+        await execute_lead_hunt(
+            callback.message,
+            niche_key=niche_key,
+            district_key=district_key,
+        )
+        return
+
+
+async def execute_lead_hunt(
+    message: Message,
+    niche_key: str = "all",
+    district_key: str = "auto",
+):
+    """Запускает парсер + скоринг + ИИ-фильтр и отправляет карточки ТОП-5 лидов."""
+    niche_info = HUNT_NICHES.get(niche_key, HUNT_NICHES["all"])
+    district_info = HUNT_DISTRICTS.get(district_key, HUNT_DISTRICTS["auto"])
+
+    status_msg = await message.answer(
+        f"🕵️‍♂️ <b>Охота за лидами запущена!</b>\n"
+        f"• <b>Ниша:</b> {niche_info['title']}\n"
+        f"• <b>Локация:</b> {district_info['title']}\n\n"
+        f"⏳ <i>Сканирую выдачу Гугл Карт, отсеиваю нецелевые точки и считаю математику 5⭐️ отзывов...</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
+        try:
+            leads, scanned_total = await lead_hunter_service.hunt_best_leads(
+                niche_key=niche_key,
+                district_key=district_key,
+                top_n=5,
+            )
+        except Exception as e:
+            logger.exception("Ошибка при Автопоиске лидов: %s", e)
+            await status_msg.edit_text(
+                f"❌ <b>Ошибка при сканировании:</b>\n<code>{html.escape(str(e))}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+    if not leads:
+        await status_msg.edit_text(
+            "🔍 <b>Новых подходящих лидов в этом узком секторе не найдено.</b>\n\n"
+            "Попробуйте выбрать другой район или нажмите «🔄 Сбросить просмотренные».",
+            parse_mode=ParseMode.HTML,
+            reply_markup=make_hunt_niche_keyboard(),
+        )
+        return
+
+    await status_msg.edit_text(
+        f"✅ <b>Готово! Просканировано карточек: {scanned_total}</b>\n"
+        f"Отобрано <b>ТОП-{len(leads)} самых горячих заведений</b> "
+        f"({niche_info['short']} — {district_info['short']}):",
+        parse_mode=ParseMode.HTML,
+    )
+
+    for idx, scored_lead in enumerate(leads, start=1):
+        card_html = format_scored_lead_card(scored_lead, rank=idx)
+        kb = make_place_keyboard(scored_lead.place)
+        await message.answer(
+            card_html,
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+
+    await message.answer(
+        f"👆 <b>Нажмите на любую кнопку под карточкой выше</b>, чтобы мгновенно сгенерировать плотный питч "
+        f"(Инста / Телеграм / ГС) с учётом цифр этого заведения.\n\n"
+        f"Хотите ещё пачку свежих лидов без повторов?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=make_hunt_more_keyboard(niche_key, district_key),
+    )
 
 
 @router.message(Command("help"))
@@ -326,19 +643,22 @@ async def cmd_help(message: Message):
     """Справка и инструкция по записи NFC Tools."""
     text = (
         "📖 <b>Инструкция для команды HHtap</b>\n\n"
-        "<b>1. Запись чипа в NFC Tools:</b>\n"
-        "• Отправьте боту название заведения или ссылку.\n"
+        "<b>1. Автопоиск горячих лидов:</b>\n"
+        "• Нажмите <b>«🎯 Автопоиск ТОП-лидов»</b> или <b>«🔥 Быстрый рейд»</b>.\n"
+        "• Бот сам просканирует выбранный район Ташкента, рассчитает сколько пятёрок не хватает каждой точке, "
+        "и выдаст ТОП-5 заведений с самым высоким потенциалом покупки.\n\n"
+        "<b>2. Запись чипа в NFC Tools:</b>\n"
         "• Нажмите <b>«🔍 Проверить ссылку»</b>, чтобы убедиться, что открывается окно с 5 звёздами.\n"
         "• Тапните по ссылке в сообщении — она скопируется в буфер.\n"
         "• В приложении <b>NFC Tools</b> (Write ➔ Add a record ➔ Custom URL) вставьте ссылку и запишите на чип.\n\n"
-        "<b>2. ИИ-ассистент по продажам:</b>\n"
-        "• <b>📸 Инста Direct:</b> первое короткое цепляющее сообщение на 2 абзаца с цифрами карточки.\n"
-        "• <b>✈️ Телеграм:</b> сопроводительный текст для отправки вместе с демо-видео работы карты.\n"
-        "• <b>🎤 Текст для ГС:</b> 3 тезиса на 15 секунд разговорной речи для голосовых сообщений.\n"
-        "• <b>🛡 Отработать возражение:</b> ответы на частые возражения («Есть QR», «Дорого», «Скиньте КП»).\n\n"
+        "<b>3. ИИ-ассистент по продажам:</b>\n"
+        "• <b>📸 Инста Direct:</b> плотное 3-абзацное сообщение с локальной привязкой и расчётом выгоды.\n"
+        "• <b>✈️ Телеграм:</b> сопроводительный текст под 8-секундное демо-видео работы карты.\n"
+        "• <b>🎤 Текст для ГС:</b> готовый текст на 20–25 секунд уверенной речи для голосового или кружка.\n"
+        "• <b>🛡 Отработать возражение:</b> аргументированные ответы («Есть QR», «Дорого», «Скиньте КП»).\n\n"
         "🆔 Узнать свой ID: /id"
     )
-    await message.answer(text, parse_mode=ParseMode.HTML)
+    await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=make_main_reply_keyboard())
 
 
 @router.message(Command("id"))
@@ -521,9 +841,6 @@ async def handle_text_message(message: Message):
     async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
         try:
             if url_match:
-                # --------------------------------------------------------------
-                # Сценарий Б: короткая ссылка Google Maps
-                # --------------------------------------------------------------
                 found_url = url_match.group(0).strip()
                 logger.info("Обрабатываем ссылку Google Maps: %s", found_url)
 
@@ -544,19 +861,16 @@ async def handle_text_message(message: Message):
                 )
 
             else:
-                # --------------------------------------------------------------
-                # Сценарий А: Текстовый поиск
-                # --------------------------------------------------------------
                 logger.info("Текстовый поиск: '%s'", text)
                 places = await resolve_search_text(query=text, max_results=3)
 
                 if not places:
                     await message.reply(
                         "🔍 <b>Ничего не найдено</b>\n\n"
-                        f"По запросу «<i>{text}</i>» заведений не обнаружено.\n\n"
+                        f"По запросу «<i>{html.escape(text)}</i>» заведений не обнаружено.\n\n"
                         "💡 <b>Совет:</b>\n"
                         "• Добавьте город или улицу (например: <i>Roni Тараса Шевченко Ташкент</i>)\n"
-                        "• Или скопируйте ссылку на заведение прямо из Google Maps и отправьте боту.",
+                        "• Или нажмите <b>«🎯 Автопоиск ТОП-лидов»</b> внизу экрана!",
                         parse_mode=ParseMode.HTML,
                     )
                     return
@@ -609,17 +923,11 @@ async def send_places_results(
     places: List[PlaceInfo],
     header: Optional[str] = None,
 ):
-    """
-    Отправляет пользователю карточки найденных точек (до 3 заведений).
-    Каждая карточка содержит:
-    - Название, рейтинг, адрес
-    - Чистую ссылку в <code>...</code> для копирования в 1 клик
-    - Меню с кнопками проверки и генерации ИИ-питчей
-    """
+    """Отправляет пользователю карточки найденных точек (до 3 заведений)."""
     if header and len(places) > 1:
         await message.answer(header, parse_mode=ParseMode.HTML)
 
-    for idx, place in enumerate(places, start=1):
+    for place in places:
         card_text = format_place_card(place)
         keyboard = make_place_keyboard(place)
         await message.answer(
@@ -651,7 +959,7 @@ async def main():
     if config.has_google_api_key():
         logger.info("Режим парсера: Официальный Google Places API.")
     else:
-        logger.info("Режим парсера: Автономный БЕСПЛАТНЫЙ режим (без Google API ключей и без карт).")
+        logger.info("Режим парсера: Автономный БЕСПЛАТНЫЙ режим (с рейтингами и отзывами, без ключей).")
 
     if config.has_anymodel_key():
         logger.info("ИИ-ассистент: Активен (модель %s, URL: %s)", config.anymodel_model, config.anymodel_base_url)

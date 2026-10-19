@@ -2,7 +2,7 @@ import asyncio
 import logging
 import re
 import urllib.parse
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 import httpx
 from playwright.async_api import async_playwright, Playwright, Browser, Page
 
@@ -21,9 +21,10 @@ FINDER_URL = "https://geo-devrel-javascript-samples.web.app/samples/places-place
 
 class KeylessPlacesService:
     """
-    Автономный сервис для получения Place ID и прямых ссылок для NFC Tools
-    БЕЗ использования платных ключей Google Cloud и БЕЗ привязки банковских карт.
-    Использует легковесный фоновый Chromium (Playwright).
+    Автономный сервис для получения Place ID, рейтингов, количества отзывов
+    и прямых ссылок для NFC Tools БЕЗ платных ключей Google Cloud.
+    Использует встроенный объект google.maps.places.PlacesService внутри
+    фонового Chromium (Playwright), получая до 20 точек за 0.3 сек.
     """
 
     def __init__(self):
@@ -33,7 +34,7 @@ class KeylessPlacesService:
         self._lock = asyncio.Lock()
 
     async def _ensure_page(self) -> Page:
-        """Поддерживает активную вкладку поиска с минимальным потреблением ресурсов."""
+        """Поддерживает активную вкладку с загруженным Google Maps Places SDK."""
         if self._browser and self._page and not self._page.is_closed():
             return self._page
 
@@ -59,15 +60,56 @@ class KeylessPlacesService:
         )
 
         self._page = await context.new_page()
-        logger.info("Загрузка сервиса Google Maps...")
+        logger.info("Загрузка сервиса Google Maps SDK...")
         await self._page.goto(FINDER_URL, wait_until="networkidle", timeout=30000)
         await self._page.wait_for_selector("#pac-input", timeout=15000)
         logger.info("Фоновый браузер успешно инициализирован.")
         return self._page
 
-    async def search_text(self, query: str, max_results: int = 3) -> List[PlaceInfo]:
+    async def _text_search_via_sdk(self, query: str, max_results: int = 20) -> List[Dict[str, Any]]:
         """
-        Ищет заведение по текстовому названию и возвращает список найденных точек с Place ID.
+        Выполняет быстрый запрос через google.maps.places.PlacesService.textSearch
+        прямо внутри страницы, возвращая до 20 заведений с точным рейтингом и числом отзывов.
+        """
+        page = await self._ensure_page()
+        raw_items = await page.evaluate(
+            """(q) => new Promise((resolve) => {
+                try {
+                    if (!window.google || !google.maps || !google.maps.places) {
+                        return resolve([]);
+                    }
+                    const svc = new google.maps.places.PlacesService(document.createElement('div'));
+                    svc.textSearch({ query: q, language: 'ru' }, (results, status) => {
+                        if (status !== 'OK' || !results) {
+                            return resolve([]);
+                        }
+                        const mapped = results.map(r => ({
+                            place_id: r.place_id || '',
+                            name: r.name || '',
+                            address: r.formatted_address || '',
+                            rating: typeof r.rating === 'number' ? r.rating : null,
+                            user_ratings_total: typeof r.user_ratings_total === 'number' ? r.user_ratings_total : null,
+                            types: Array.isArray(r.types) ? r.types : [],
+                            business_status: r.business_status || 'OPERATIONAL',
+                            lat: r.geometry && r.geometry.location ? r.geometry.location.lat() : null,
+                            lng: r.geometry && r.geometry.location ? r.geometry.location.lng() : null
+                        }));
+                        resolve(mapped);
+                    });
+                } catch (err) {
+                    resolve([]);
+                }
+            })""",
+            query,
+        )
+        if not raw_items:
+            return []
+        return raw_items[:max_results]
+
+    async def search_batch_raw(self, query: str, max_results: int = 20) -> List[Dict[str, Any]]:
+        """
+        Массовый поиск заведений по запросу (для Автопоиска ТОП-лидов).
+        Возвращает сырые словари с рейтингами, количеством отзывов, типами и статусом.
         """
         clean_query = query.strip()
         if not clean_query:
@@ -75,42 +117,77 @@ class KeylessPlacesService:
 
         async with self._lock:
             try:
-                page = await self._ensure_page()
+                return await self._text_search_via_sdk(clean_query, max_results=max_results)
+            except Exception as e:
+                logger.error("Ошибка при массовом поиске '%s': %s", clean_query, e)
+                await self.close()
+                return []
 
-                # Находим строку поиска
+    async def search_text(self, query: str, max_results: int = 3) -> List[PlaceInfo]:
+        """
+        Ищет заведение по текстовому названию и возвращает список найденных точек
+        с Place ID, реальным рейтингом и количеством отзывов.
+        """
+        clean_query = query.strip()
+        if not clean_query:
+            return []
+
+        async with self._lock:
+            try:
+                # 1. Сначала пробуем быстрый SDK textSearch (сразу даёт рейтинг и отзывы за 0.3 сек)
+                sdk_items = await self._text_search_via_sdk(clean_query, max_results=max_results)
+                if sdk_items:
+                    results: List[PlaceInfo] = []
+                    for item in sdk_items:
+                        raw_id = item.get("place_id", "").strip()
+                        if not raw_id:
+                            continue
+                        clean_id = clean_place_id(raw_id)
+                        if not clean_id or any(x.place_id == clean_id for x in results):
+                            continue
+                        results.append(
+                            PlaceInfo(
+                                place_id=clean_id,
+                                name=(item.get("name") or clean_query).strip(),
+                                address=(item.get("address") or "Адрес в Google Maps").strip(),
+                                rating=item.get("rating"),
+                                user_ratings_total=item.get("user_ratings_total"),
+                                review_url=build_review_url(clean_id),
+                                google_maps_url=f"https://www.google.com/maps/place/?q=place_id:{clean_id}",
+                                latitude=item.get("lat"),
+                                longitude=item.get("lng"),
+                            )
+                        )
+                    if results:
+                        return results[:max_results]
+
+                # 2. Fallback на Autocomplete (#pac-input), если textSearch ничего не вернул
+                page = await self._ensure_page()
                 input_elem = await page.wait_for_selector("#pac-input", timeout=10000)
                 if not input_elem:
                     return []
 
-                # Очищаем поле и кликаем
                 await input_elem.click()
                 await input_elem.fill("")
                 await asyncio.sleep(0.1)
-
-                # Печатаем запрос с небольшой задержкой для срабатывания Google Autocomplete
                 await input_elem.type(clean_query, delay=35)
 
-                # Ожидаем появления выпадающего списка вариантов Google (.pac-item)
                 try:
                     await page.wait_for_selector(".pac-item", timeout=5000)
                 except Exception:
                     logger.info("Подсказки Google Autocomplete не появились для '%s'", clean_query)
                     return []
 
-                # Проверяем количество доступных подсказок
                 items_count = await page.evaluate(
                     "() => document.querySelectorAll('.pac-item').length"
                 )
-
                 if items_count == 0:
                     return []
 
                 count_to_fetch = min(items_count, max_results)
-                results: List[PlaceInfo] = []
+                results = []
 
-                # Извлекаем данные для заведений
                 for idx in range(count_to_fetch):
-                    # Если нужно повторно ввести запрос для следующего филиала
                     if idx > 0:
                         await input_elem.click()
                         await input_elem.fill("")
@@ -120,7 +197,6 @@ class KeylessPlacesService:
                         except Exception:
                             break
 
-                    # Нажимаем стрелку вниз нужное количество раз и Enter
                     for _ in range(idx + 1):
                         await page.keyboard.press("ArrowDown")
                         await asyncio.sleep(0.1)
@@ -128,7 +204,6 @@ class KeylessPlacesService:
                     await page.keyboard.press("Enter")
                     await asyncio.sleep(0.8)
 
-                    # Считываем результат
                     data = await page.evaluate(
                         """() => {
                             const placeId = document.getElementById('place-id')?.textContent || '';
@@ -167,7 +242,7 @@ class KeylessPlacesService:
     async def search_by_url(self, short_url: str) -> List[PlaceInfo]:
         """
         Разворачивает короткую ссылку Google Maps (maps.app.goo.gl)
-        и находит по ней точный Place ID.
+        и находит по ней точный Place ID вместе с рейтингом и отзывами.
         """
         async with httpx.AsyncClient(
             follow_redirects=True,
@@ -185,7 +260,6 @@ class KeylessPlacesService:
 
         logger.info("Развернутая ссылка: %s", final_url)
 
-        # 1. Извлекаем название из /maps/place/Name/
         name_match = re.search(r"/maps/place/([^/@?]+)", final_url)
         place_name = None
         if name_match:
@@ -193,7 +267,6 @@ class KeylessPlacesService:
             place_name = re.sub(r"\s+", " ", place_name)
 
         if not place_name:
-            # 2. Извлекаем из query параметра q
             parsed = urllib.parse.urlparse(final_url)
             qs = urllib.parse.parse_qs(parsed.query)
             if "q" in qs:
