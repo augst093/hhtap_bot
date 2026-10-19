@@ -62,7 +62,11 @@ class Config:
         )
     )
     anymodel_model: str = field(
-        default_factory=lambda: os.getenv("ANYMODEL_MODEL", "gpt-6-luna").strip()
+        default_factory=lambda: (
+            "cx/gpt-6-luna"
+            if os.getenv("ANYMODEL_MODEL", "").strip() in ("", "gpt-6-luna")
+            else os.getenv("ANYMODEL_MODEL", "cx/gpt-6-luna").strip()
+        )
     )
 
     def has_anymodel_key(self) -> bool:
