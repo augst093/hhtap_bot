@@ -54,7 +54,12 @@ class Config:
         default_factory=lambda: os.getenv("ANYMODEL_API_KEY", "").strip()
     )
     anymodel_base_url: str = field(
-        default_factory=lambda: os.getenv("ANYMODEL_BASE_URL", "https://api.anymodel.org/v1").strip().rstrip("/")
+        default_factory=lambda: (
+            os.getenv("ANYMODEL_BASE_URL", "https://anymodel.org/v1")
+            .strip()
+            .rstrip("/")
+            .replace("api.anymodel.org", "anymodel.org")
+        )
     )
     anymodel_model: str = field(
         default_factory=lambda: os.getenv("ANYMODEL_MODEL", "gpt-6-luna").strip()

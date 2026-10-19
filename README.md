@@ -56,7 +56,7 @@ hhtap_bot/
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | Токен бота от @BotFather (Обязательно) | — |
 | `ANYMODEL_API_KEY` | API-ключ Anymodel.org для ИИ-ассистента | — |
-| `ANYMODEL_BASE_URL` | Базовый URL API Anymodel | `https://api.anymodel.org/v1` |
+| `ANYMODEL_BASE_URL` | Базовый URL API Anymodel | `https://anymodel.org/v1` |
 | `ANYMODEL_MODEL` | Модель ИИ для генерации питчей | `gpt-6-luna` |
 | `ADMIN_IDS` | ID сотрудников через запятую (если пусто — доступ всем) | ` ` |
 | `GOOGLE_API_KEY` | Ключ Google Places API (опционально, если пусто — автономный режим) | ` ` |
