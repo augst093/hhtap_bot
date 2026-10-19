@@ -50,6 +50,20 @@ class Config:
     default_region: str = field(
         default_factory=lambda: os.getenv("DEFAULT_REGION", "uz").strip()
     )
+    anymodel_api_key: str = field(
+        default_factory=lambda: os.getenv("ANYMODEL_API_KEY", "").strip()
+    )
+    anymodel_base_url: str = field(
+        default_factory=lambda: os.getenv("ANYMODEL_BASE_URL", "https://api.anymodel.org/v1").strip().rstrip("/")
+    )
+    anymodel_model: str = field(
+        default_factory=lambda: os.getenv("ANYMODEL_MODEL", "gpt-6-luna").strip()
+    )
+
+    def has_anymodel_key(self) -> bool:
+        """Проверяет, задан ли ключ Anymodel.org."""
+        return bool(self.anymodel_api_key and self.anymodel_api_key != "your_anymodel_api_key_here")
+
 
     def is_admin(self, user_id: int) -> bool:
         """
