@@ -440,8 +440,7 @@ class AISalesService:
         # Если модель случайно вставила название заведения — аккуратно убираем
         clean_v = (venue_name or "").strip().strip('"\'«»')
         if clean_v and len(clean_v) >= 3:
-            text = re.sub(rf"\s+в\s+{re.escape(clean_v)}\b", " у вас", text, flags=re.IGNORECASE)
-            text = re.sub(rf"\s+{re.escape(clean_v)}\b", "", text, flags=re.IGNORECASE)
+            text = re.sub(rf"\s*{re.escape(clean_v)}\b", "", text, flags=re.IGNORECASE)
 
         # Убираем книжные двоеточия и точки с запятой внутри предложений
         text = re.sub(r"\s*[:;]\s+", " — ", text)
