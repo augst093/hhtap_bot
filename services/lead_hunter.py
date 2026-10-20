@@ -376,9 +376,14 @@ def evaluate_lead_potential(item: Dict[str, Any]) -> Optional[ScoredLead]:
     rating = item.get("rating")
     reviews = item.get("user_ratings_total")
 
-    # Отсекаем раскачанных гигантов (>380 отзывов при высоком рейтинге) и убитые точки (<3.2)
+    # ЖЁСТКИЙ ФИЛЬТР:
+    # 1. Отсекаем точки с большим числом отзывов (>130) — там рейтинг двигается медленно
+    # 2. Отсекаем точки с высокой оценкой (>=4.75 при >20 отзывах) — у владельца нет острой боли
+    # 3. Отсекаем совсем мёртвые точки (<3.2)
     if rating is not None and reviews is not None:
-        if reviews > 380 and rating >= 4.7:
+        if reviews > 130:
+            return None
+        if rating >= 4.75 and reviews > 20:
             return None
         if rating < 3.2:
             return None
@@ -388,114 +393,99 @@ def evaluate_lead_potential(item: Dict[str, Any]) -> Optional[ScoredLead]:
     loc_label = f"на {street}" if street else "в плотной локации"
 
     # Фактор 3: Премиальность формата (чек и наличие папки со счётом / ресепшена)
-    format_bonus = 8
+    format_bonus = 7
     if any(k in low_name for k in HIGH_CHECK_KEYWORDS):
-        format_bonus = 13
+        format_bonus = 11
 
     # Фактор 4: Денежность улицы
-    street_bonus = 6
+    street_bonus = 5
     if any(st in low_addr for st in PRIME_STREETS):
-        street_bonus = 11
+        street_bonus = 10
     elif street:
-        street_bonus = 8
+        street_bonus = 7
 
     # Микро-вариация (-1..+1) от хэша place_id для честного ранжирования без одинаковых цифр
     tie_breaker = int(hashlib.md5(clean_id.encode("utf-8")).hexdigest()[:2], 16) % 3 - 1
 
     # --------------------------------------------------------------------------
-    # СЕГМЕНТ А: «Огромный потенциал, мало отзывов» (4.5 .. 5.0 ⭐️, но всего 3..60 отзывов)
+    # ПРИОРИТЕТ №1 (ЗОЛОТОЙ ЛИД): Оценка 3.4 .. 4.35 ⭐️ И МАЛО ОТЗЫВОВ (3 .. 65 отз.)
+    # Максимальная боль + мгновенное исправление за 1–3 смены! (Баллы: 88 .. 98)
     # --------------------------------------------------------------------------
-    if rating is not None and rating >= 4.5 and (reviews is None or reviews <= 60):
-        rev_count = reviews or 0
-        # Чем меньше отзывов у хорошей точки (особенно 6..32), тем выше ценность первых 50 пятёрок
-        if 6 <= rev_count <= 25:
-            pain_score = 54
-        elif 26 <= rev_count <= 42:
-            pain_score = 50
-        elif rev_count < 6:
-            pain_score = 48
+    if rating is not None and 3.4 <= rating <= 4.35 and reviews is not None and 3 <= reviews <= 65:
+        if 3.7 <= rating <= 4.3:
+            pain_score = 59  # Самый сок: чуть ниже 4.5⭐️, владельцу больно смотреть на карточку
         else:
-            pain_score = 45
+            pain_score = 55  # 3.4..3.6⭐️ — острая проблема с репутацией
 
-        # Бонус за высокий текущий рейтинг (владелец трясётся над репутацией)
-        speed_bonus = 17 if rating >= 4.7 else 14
-        raw_score = pain_score + speed_bonus + format_bonus + street_bonus + tie_breaker
-        score = max(72, min(98, raw_score))
-
-        tier_badge = "🚀 Огромный потенциал (Мало отзывов)"
-        if rev_count > 0:
-            to_100 = max(35, 100 - rev_count)
-            shifts = max(3, round(to_100 / 12))
-            why_hot = (
-                f"Высокий уровень ({rating:.1f}⭐️), но в Гугле всего {rev_count} отзывов — "
-                f"точка {loc_label} теряется на фоне соседей, а 1–2 случайные тройки сразу собьют рейтинг. "
-                f"NFC-карта к счёту даст +{to_100} пятёрок (до первой сотни) за {shifts}–{shifts + 2} смен."
-            )
+        # Чем меньше отзывов (и меньше пятёрок нужно до 4.5⭐️), тем быстрее эффект от NFC-карты
+        if needed_5 <= 15:
+            speed_bonus = 18  # Поднимается до 4.5⭐️ буквально за 1–2 смены!
+        elif needed_5 <= 30:
+            speed_bonus = 16  # За 2–3 смены
         else:
-            why_hot = (
-                f"Перспективная точка {loc_label} с пустой карточкой в Гугле. "
-                f"С NFC-картой к счёту соберут первые 50–100 живых пятёрок в первый же месяц."
-            )
-
-    # --------------------------------------------------------------------------
-    # СЕГМЕНТ Б: «Острая боль — Просаженный рейтинг» (3.4 .. 4.4 ⭐️ при 8..180 отзывах)
-    # --------------------------------------------------------------------------
-    elif rating is not None and 3.4 <= rating <= 4.4 and reviews is not None and 8 <= reviews <= 180:
-        # Идеальный клиент: рейтинг 3.9–4.3 (чуть ниже психологических 4.5⭐️) и нужно 10–55 пятёрок
-        if 3.9 <= rating <= 4.3:
-            pain_score = 55
-        elif 3.6 <= rating < 3.9:
-            pain_score = 51
-        else:
-            pain_score = 47
-
-        # Чем быстрее окупается (меньше смен нужно до 4.5⭐️), тем выше балл
-        if needed_5 <= 22:
-            speed_bonus = 18  # Исправляется за 2 смены!
-        elif needed_5 <= 45:
-            speed_bonus = 15  # Исправляется за 3-4 смены
-        elif needed_5 <= 75:
-            speed_bonus = 12
-        else:
-            speed_bonus = 8
+            speed_bonus = 14
 
         raw_score = pain_score + speed_bonus + format_bonus + street_bonus + tie_breaker
-        score = max(74, min(98, raw_score))
+        score = max(88, min(98, raw_score))
 
-        shifts = max(2, round(needed_5 / 12))
-        tier_badge = "🔥 Острая боль (Просажен рейтинг)"
+        shifts = max(1, round(needed_5 / 12))
+        tier_badge = "🔥 Идеальный лид (3.5–4.3⭐️ и мало отзывов)"
         why_hot = (
-            f"Точка {loc_label} теряет гостей из поиска из-за оценки {rating:.1f}⭐️ ({reviews} отз.). "
-            f"Математика простая: чтобы выйти на {target_r:.1f}⭐️, нужно ровно ~{needed_5} пятёрок "
-            f"— с нашей NFC-картой к счёту они закроют это за {shifts}–{shifts + 2} смены."
+            f"Критический рейтинг {rating:.1f}⭐️ при всего {reviews} отз. — точка {loc_label} прямо сейчас теряет клиентов в поиске Гугла. "
+            f"Но за счёт малого числа оценок им нужно всего ~{needed_5} пятёрок, чтобы взлететь до {target_r:.1f}⭐️ "
+            f"— с нашей NFC-картой к счёту они исправят это за {shifts}–{shifts + 1} смены!"
         )
 
     # --------------------------------------------------------------------------
-    # СЕГМЕНТ В: «Точка роста — Борьба за ТОП улицы» (4.45 .. 4.75 ⭐️ при 61..240 отзывах)
+    # ПРИОРИТЕТ №2: Оценка 3.4 .. 4.4 ⭐️ при среднем числе отзывов (66 .. 130 отз.)
+    # Тоже просаженный рейтинг, но нужно чуть больше пятёрок (Баллы: 79 .. 87)
     # --------------------------------------------------------------------------
-    elif rating is not None and 4.4 < rating <= 4.75 and reviews is not None and 61 <= reviews <= 260:
-        pain_score = 43 if rating <= 4.6 else 39
-        speed_bonus = 13 if needed_5 <= 50 else 10
+    elif rating is not None and 3.4 <= rating <= 4.4 and reviews is not None and 66 <= reviews <= 130:
+        pain_score = 50 if rating >= 3.8 else 47
+        speed_bonus = 13 if needed_5 <= 55 else 10
+
         raw_score = pain_score + speed_bonus + format_bonus + street_bonus + tie_breaker
-        score = max(68, min(89, raw_score))
+        score = max(79, min(87, raw_score))
 
         shifts = max(3, round(needed_5 / 12))
-        tier_badge = "💎 Точка роста (Обгон конкурентов)"
+        tier_badge = "⚡️ Острая боль (Просажен рейтинг)"
         why_hot = (
-            f"Активное заведение {loc_label} ({rating:.1f}⭐️, {reviews} отз.), но до порога {target_r:.1f}⭐️ "
-            f"и отрыва от соседей не хватает ~{needed_5} пятёрок (~{shifts} смен с NFC-картой вместо QR)."
+            f"Точка {loc_label} упускает горячий трафик из-за оценки {rating:.1f}⭐️ ({reviews} отз.). "
+            f"Чтобы выйти на зелёный порог {target_r:.1f}⭐️, нужно ~{needed_5} пятёрок "
+            f"— с NFC-картой при оплате они закроют эту задачу за {shifts}–{shifts + 2} смен."
         )
 
     # --------------------------------------------------------------------------
-    # СЕГМЕНТ Г: Прочие рабочие точки
+    # ПРИОРИТЕТ №3: Мало отзывов (до 45 отз.) и пограничный рейтинг 4.36 .. 4.65 ⭐️
+    # Любая единица/двойка обрушит их ниже 4.3⭐️ (Баллы: 71 .. 78)
+    # --------------------------------------------------------------------------
+    elif rating is not None and 4.35 < rating <= 4.65 and (reviews is None or reviews <= 45):
+        rev_count = reviews or 0
+        pain_score = 44 if rev_count <= 25 else 40
+        speed_bonus = 12
+        raw_score = pain_score + speed_bonus + format_bonus + street_bonus + tie_breaker
+        score = max(71, min(78, raw_score))
+
+        tier_badge = "🚀 Мало отзывов (Уязвимый рейтинг)"
+        why_hot = (
+            f"У точки {loc_label} всего {rev_count} отз. при оценке {rating:.1f}⭐️ — "
+            f"буквально 1–2 случайные тройки сразу уронят рейтинг в красную зону (<4.3⭐️). "
+            f"NFC-карта к счёту создаст подушку безопасности из +40–50 живых пятёрок за пару недель."
+        )
+
+    # --------------------------------------------------------------------------
+    # ПРИОРИТЕТ №4: Свежие точки с совсем крошечным числом отзывов (до 20 отз.)
     # --------------------------------------------------------------------------
     else:
+        rev_count = reviews or 0
+        if rev_count > 55:
+            return None
         raw_score = 36 + format_bonus + street_bonus + tie_breaker
-        score = max(62, min(82, raw_score))
-        tier_badge = "📈 Автоматизация потока отзывов"
-        r_info = f"{rating:.1f}⭐️ ({reviews} отз.) " if (rating and reviews) else ""
+        score = max(64, min(72, raw_score))
+        tier_badge = "📈 Дефицит отзывов в Гугле"
+        r_info = f"{rating:.1f}⭐️ (всего {rev_count} отз.) " if (rating and rev_count) else ""
         why_hot = (
-            f"Заведение {r_info}{loc_label}: 95% довольных гостей уходят после счёта молча, "
+            f"Заведение {r_info}{loc_label}: карточка полупустая, 95% довольных гостей уходят молча, "
             f"а бумажные QR-коды сканируют меньше 2% посетителей."
         )
 
@@ -798,39 +788,35 @@ class LeadHunterService:
                         batch_names.add(nkey)
                     scored_fresh.append(lead)
 
-            # Как только набрали хотя бы 8 свежих кандидатов для выбора лучших 5 — выходим из цикла
-            if len(scored_fresh) >= max(top_n + 3, 8):
+            # Выходим пораньше, только если уже нашли достаточно «больных» лидов (3.5–4.3⭐️ и мало отзывов)
+            golden_count = sum(1 for x in scored_fresh if x.score >= 82)
+            if len(scored_fresh) >= max(top_n + 4, 9) and (golden_count >= 3 or attempt >= 2):
                 break
 
         if not scored_fresh:
             return [], total_scanned
 
-        # Сортируем по многофакторному скорингу
-        scored_fresh.sort(key=lambda x: x.score, reverse=True)
+        # Сортируем строго по приоритету:
+        # 1) Максимальный балл (где 88..98 получают именно точки 3.5–4.3⭐️ с малым числом отзывов)
+        # 2) При равном балле выше ставим точку, которой нужно МЕНЬШЕ пятёрок до 4.5⭐️ (быстрее результат)
+        # 3) И у которой меньше отзывов в карточке
+        scored_fresh.sort(
+            key=lambda x: (
+                -x.score,
+                x.needed_5stars,
+                x.place.user_ratings_total if x.place.user_ratings_total is not None else 999,
+            )
+        )
 
-        # Балансируем топ-кандидатов: чтобы в пятёрке были и «🚀 Мало отзывов», и «🔥 Просажен рейтинг»
-        high_potential = [x for x in scored_fresh if "Огромный потенциал" in x.tier_badge]
-        rating_pain = [x for x in scored_fresh if "Острая боль" in x.tier_badge]
-        others = [x for x in scored_fresh if x not in high_potential and x not in rating_pain]
-
-        balanced_pool: List[ScoredLead] = []
-        hp_idx, rp_idx = 0, 0
-        while len(balanced_pool) < 10 and (hp_idx < len(high_potential) or rp_idx < len(rating_pain)):
-            if hp_idx < len(high_potential):
-                balanced_pool.append(high_potential[hp_idx])
-                hp_idx += 1
-            if rp_idx < len(rating_pain) and len(balanced_pool) < 10:
-                balanced_pool.append(rating_pain[rp_idx])
-                rp_idx += 1
-
-        for o in others:
-            if len(balanced_pool) < 10:
-                balanced_pool.append(o)
-
-        balanced_pool.sort(key=lambda x: x.score, reverse=True)
-        refined = await self._ai_refine_top_leads(balanced_pool[:10])
+        refined = await self._ai_refine_top_leads(scored_fresh[:10])
         selected = refined[:top_n]
-        selected.sort(key=lambda x: x.score, reverse=True)
+        selected.sort(
+            key=lambda x: (
+                -x.score,
+                x.needed_5stars,
+                x.place.user_ratings_total if x.place.user_ratings_total is not None else 999,
+            )
+        )
 
         # Обогащаем выбранные ТОП-5 прямыми контактами (телефон, сайт/Instagram) за ~0.2 сек
         try:
