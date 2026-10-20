@@ -584,58 +584,10 @@ class LeadHunterService:
 
     async def _ai_refine_top_leads(self, candidates: List[ScoredLead]) -> List[ScoredLead]:
         """
-        Быстрый ИИ-аудит через Anymodel (если активен):
-        отсеивает случайные нецелевые точки и сортирует лучших по коммерческому потенциалу.
+        Мгновенная детерминированная фильтрация и калибровка топ-кандидатов
+        (без лишнего сетевого запроса к Anymodel, чтобы не забивать очередь и лимиты API
+        перед нажатием кнопок генерации сообщений).
         """
-        if not config.has_anymodel_key() or len(candidates) <= 3:
-            return candidates
-
-        short_list = []
-        for idx, c in enumerate(candidates[:10]):
-            r_str = f"{c.place.rating:.1f}⭐️ ({c.place.user_ratings_total or 0} отз.)" if c.place.rating else "без оценки"
-            short_list.append(f"{idx}: {c.place.name} | {c.place.address} | {r_str} | Score={c.score}")
-
-        prompt = (
-            "Ты — коммерческий директор HHtap в Ташкенте (умные NFC-карты к счёту для сбора 5⭐️ отзывов в Гугл Картах).\n"
-            "Кандидаты из парсера:\n"
-            + "\n".join(short_list)
-            + "\n\nВыбери индексы 5 самых перспективных и платёжеспособных заведений (где есть посадка или ресепшен, хороший чек и острая нужда в 5⭐️ отзывах), "
-            "отсеяв уличный фастфуд, госучреждения или случайные магазины. "
-            "Ответь ТОЛЬКО JSON-массивом номеров, например: [0, 2, 1, 4, 3]"
-        )
-
-        endpoint = f"{config.anymodel_base_url.rstrip('/')}/chat/completions"
-        model = config.anymodel_model.strip() or "cx/gpt-6-luna"
-        headers = {
-            "Authorization": f"Bearer {config.anymodel_api_key.strip()}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
-            "max_tokens": 60,
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(endpoint, headers=headers, json=payload)
-            if resp.status_code == 200:
-                content = resp.json()["choices"][0]["message"]["content"]
-                match = re.search(r"\[[\d,\s]+\]", content)
-                if match:
-                    indices = json.loads(match.group(0))
-                    picked: List[ScoredLead] = []
-                    for i in indices:
-                        if isinstance(i, int) and 0 <= i < len(candidates) and candidates[i] not in picked:
-                            picked.append(candidates[i])
-                    for c in candidates:
-                        if c not in picked:
-                            picked.append(c)
-                    return picked
-        except Exception as e:
-            logger.info("AI-ранжирование пропущено (используем многофакторный скоринг): %s", e)
-
         return candidates
 
     async def hunt_best_leads(
