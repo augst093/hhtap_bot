@@ -294,34 +294,34 @@ def format_carousel_slide(batch: HuntCarouselBatch, idx: int) -> str:
 
 def make_carousel_keyboard(batch: HuntCarouselBatch, idx: int) -> InlineKeyboardMarkup:
     """
-    Создаёт клавиатуру для текущего слайда карусели:
-    - Все кнопки работы с заведением (Проверить ссылку, Инста, Телеграм, ГС, Возражения)
-    - Стрелки перелистывания ⬅️ [ 1 / 5 ] ➡️
-    - Кнопка добора следующих 5 новых лидов и смены района
+    Минималистичная и эстетичная клавиатура слайда карусели:
+    Ряд 1: [ ✉️ Написать ] | [ 🔗 Ссылка 5⭐️ ]
+    Ряд 2: [ ⬅️ ] | [ 📍 1 из 5 ] | [ ➡️ ]
+    Ряд 3: [ ⚡️ Поиск и локации ]
+    Все питчи (Инста, ТГ, ГС, Возражения) и доп. настройки аккуратно раскрываются по клику.
     """
     total = len(batch.leads)
     lead = batch.leads[idx]
     short_id = cache_place(lead.place, batch_id=batch.batch_id, slide_idx=idx)
 
-    # Строка навигации со стрелками влево/вправо
     nav_row: List[InlineKeyboardButton] = []
     if idx > 0:
         nav_row.append(
             InlineKeyboardButton(
-                text="⬅️ Предыдущий",
+                text="⬅️",
                 callback_data=f"hunt:page:{batch.batch_id}:{idx - 1}",
             )
         )
     nav_row.append(
         InlineKeyboardButton(
-            text=f"📍 {idx + 1} из {total}",
+            text=f"📍 {idx + 1} / {total}",
             callback_data="hunt:noop",
         )
     )
     if idx < total - 1:
         nav_row.append(
             InlineKeyboardButton(
-                text="Следующий ➡️",
+                text="➡️",
                 callback_data=f"hunt:page:{batch.batch_id}:{idx + 1}",
             )
         )
@@ -330,113 +330,141 @@ def make_carousel_keyboard(batch: HuntCarouselBatch, idx: int) -> InlineKeyboard
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔍 Проверить ссылку (5⭐️)",
+                    text="✉️ Написать",
+                    callback_data=f"ai:{short_id}:msg_menu",
+                ),
+                InlineKeyboardButton(
+                    text="🔗 Ссылка 5⭐️",
                     url=lead.place.review_url,
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📸 Инста Direct",
-                    callback_data=f"ai:{short_id}:insta",
-                ),
-                InlineKeyboardButton(
-                    text="✈️ Телеграм (под видео)",
-                    callback_data=f"ai:{short_id}:tg",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🎤 Текст для ГС/Кружка",
-                    callback_data=f"ai:{short_id}:voice",
-                ),
-                InlineKeyboardButton(
-                    text="🛡 Отработать возражение",
-                    callback_data=f"ai:{short_id}:obj_menu",
                 ),
             ],
             nav_row,
             [
                 InlineKeyboardButton(
-                    text="🔥 Ещё 5 новых лидов",
-                    callback_data=f"hunt:run:{batch.niche_key}:{batch.district_key}",
+                    text="⚡️ Поиск и локации",
+                    callback_data=f"hunt:ctrl:{batch.batch_id}:{idx}",
                 ),
+            ],
+        ]
+    )
+
+
+def make_hunt_ctrl_keyboard(batch: HuntCarouselBatch, idx: int) -> InlineKeyboardMarkup:
+    """Раскрывающееся подменю управления поиском под каруселью."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
                 InlineKeyboardButton(
-                    text="🧭 Сменить район",
+                    text="🔥 Ещё 5 новых лидов в этом секторе",
+                    callback_data=f"hunt:run:{batch.niche_key}:{batch.district_key}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🧭 Сменить нишу или район",
                     callback_data="hunt:menu",
-                ),
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Назад к карточке",
+                    callback_data=f"hunt:page:{batch.batch_id}:{idx}",
+                )
             ],
         ]
     )
 
 
 def make_place_keyboard(place: PlaceInfo) -> InlineKeyboardMarkup:
-    """Создает Inline-меню под одиночной карточкой заведения (при ручном поиске)."""
+    """Минималистичное меню под одиночной карточкой заведения (при ручном поиске)."""
     short_id = cache_place(place)
-    keyboard = InlineKeyboardMarkup(
+    return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔍 Проверить ссылку",
+                    text="✉️ Написать",
+                    callback_data=f"ai:{short_id}:msg_menu",
+                ),
+                InlineKeyboardButton(
+                    text="🔗 Ссылка 5⭐️",
                     url=place.review_url,
-                )
+                ),
             ],
+        ]
+    )
+
+
+def make_messages_drawer_keyboard(short_id: str) -> InlineKeyboardMarkup:
+    """
+    Раскрывающееся меню выбора формата сообщения (открывается по нажатию «✉️ Написать»):
+    [ 📸 Инста Direct ] | [ ✈️ Телеграм (видео) ]
+    [ 🎤 Текст для ГС ] | [ 🛡 Возражения ]
+    [ ⬅️ Свернуть ]
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="📸 Инста Direct",
                     callback_data=f"ai:{short_id}:insta",
                 ),
                 InlineKeyboardButton(
-                    text="✈️ Телеграм (под видео)",
+                    text="✈️ Телеграм (видео)",
                     callback_data=f"ai:{short_id}:tg",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="🎤 Текст для ГС/Кружка",
+                    text="🎤 Текст для ГС",
                     callback_data=f"ai:{short_id}:voice",
                 ),
                 InlineKeyboardButton(
-                    text="🛡 Отработать возражение",
+                    text="🛡 Возражения",
                     callback_data=f"ai:{short_id}:obj_menu",
                 ),
             ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ Свернуть меню",
+                    callback_data=f"ai:{short_id}:back_main",
+                )
+            ],
         ]
     )
-    return keyboard
 
 
 def make_objections_keyboard(short_id: str) -> InlineKeyboardMarkup:
     """
     Подменю отработки возражений:
-    [У нас уже есть QR-код]
-    [Дорого / Не актуально]
-    [Скиньте КП, мы подумаем]
-    [⬅️ Назад]
+    [📱 У нас уже есть QR-код]
+    [💸 Дорого / Не актуально]
+    [📄 Скиньте КП, мы подумаем]
+    [⬅️ Назад к сообщениям]
     """
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="У нас уже есть QR-код",
+                    text="📱 У нас уже есть QR-код",
                     callback_data=f"ai:{short_id}:obj_qr",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="Дорого / Не актуально",
+                    text="💸 Дорого / Не актуально",
                     callback_data=f"ai:{short_id}:obj_price",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="Скиньте КП, мы подумаем",
+                    text="📄 Скиньте КП, мы подумаем",
                     callback_data=f"ai:{short_id}:obj_think",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Назад к карточке",
-                    callback_data=f"ai:{short_id}:back_main",
+                    text="⬅️ Назад к сообщениям",
+                    callback_data=f"ai:{short_id}:msg_menu",
                 )
             ],
         ]
@@ -668,6 +696,26 @@ async def handle_hunt_callbacks(callback: CallbackQuery):
         await callback.answer(f"ТОП-{slide_idx + 1} из {len(batch.leads)}")
         return
 
+    # Открытие подменю «⚡️ Поиск и локации» под слайдом карусели
+    if action == "ctrl" and len(parts) >= 4:
+        batch_id = parts[2]
+        try:
+            slide_idx = int(parts[3])
+        except ValueError:
+            await callback.answer()
+            return
+
+        batch = carousel_cache.get(batch_id)
+        if not batch or not (0 <= slide_idx < len(batch.leads)):
+            await callback.answer("⚠️ Эта подборка устарела.", show_alert=True)
+            return
+
+        await callback.message.edit_reply_markup(
+            reply_markup=make_hunt_ctrl_keyboard(batch, slide_idx)
+        )
+        await callback.answer()
+        return
+
     if action == "menu":
         seen = lead_hunter_service.seen_count()
         text = (
@@ -832,7 +880,15 @@ async def handle_ai_callbacks(callback: CallbackQuery):
     short_id = parts[1]
     action = parts[2]
 
-    # 1. Открытие подменю возражений
+    # 0. Открытие меню выбора сообщений («✉️ Написать»)
+    if action == "msg_menu":
+        await callback.message.edit_reply_markup(
+            reply_markup=make_messages_drawer_keyboard(short_id)
+        )
+        await callback.answer()
+        return
+
+    # 1. Открытие подменю возражений («🛡 Возражения»)
     if action == "obj_menu":
         await callback.message.edit_reply_markup(
             reply_markup=make_objections_keyboard(short_id)
