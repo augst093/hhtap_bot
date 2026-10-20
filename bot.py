@@ -4,6 +4,7 @@ import html
 import logging
 import re
 import sys
+import uuid
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -74,7 +75,7 @@ BTN_RESET_SEEN = "🔄 Сбросить просмотренные"
 
 
 # ==============================================================================
-# In-memory кэш найденных заведений (для коротких callback_data до 64 байт)
+# In-memory кэш найденных заведений и каруселей ТОП-5
 # ==============================================================================
 @dataclass
 class CachedPlace:
@@ -84,12 +85,28 @@ class CachedPlace:
     rating: Optional[float]
     reviews_count: Optional[int]
     review_link: str
+    batch_id: Optional[str] = None
+    slide_idx: Optional[int] = None
+
+
+@dataclass
+class HuntCarouselBatch:
+    batch_id: str
+    niche_key: str
+    district_key: str
+    scanned_total: int
+    leads: List[ScoredLead]
 
 
 place_cache: Dict[str, CachedPlace] = {}
+carousel_cache: Dict[str, HuntCarouselBatch] = {}
 
 
-def cache_place(place: PlaceInfo) -> str:
+def cache_place(
+    place: PlaceInfo,
+    batch_id: Optional[str] = None,
+    slide_idx: Optional[int] = None,
+) -> str:
     """Сохраняет данные заведения в кэш и возвращает короткий 8-символьный хэш."""
     raw = f"{place.place_id}:{place.name}"
     short_id = hashlib.md5(raw.encode("utf-8")).hexdigest()[:8]
@@ -100,11 +117,34 @@ def cache_place(place: PlaceInfo) -> str:
         rating=place.rating,
         reviews_count=place.user_ratings_total,
         review_link=place.review_url,
+        batch_id=batch_id,
+        slide_idx=slide_idx,
     )
-    if len(place_cache) > 1500:
+    if len(place_cache) > 2000:
         oldest_key = next(iter(place_cache))
         del place_cache[oldest_key]
     return short_id
+
+
+def cache_carousel_batch(
+    niche_key: str,
+    district_key: str,
+    scanned_total: int,
+    leads: List[ScoredLead],
+) -> str:
+    """Сохраняет пачку из 5 лидов для перелистывания в одном сообщении."""
+    batch_id = uuid.uuid4().hex[:8]
+    carousel_cache[batch_id] = HuntCarouselBatch(
+        batch_id=batch_id,
+        niche_key=niche_key,
+        district_key=district_key,
+        scanned_total=scanned_total,
+        leads=leads,
+    )
+    if len(carousel_cache) > 500:
+        oldest = next(iter(carousel_cache))
+        del carousel_cache[oldest]
+    return batch_id
 
 
 # ==============================================================================
@@ -132,7 +172,7 @@ def make_hunt_niche_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🍽 Рестораны и Стейк-хаусы", callback_data="hunt:niche:rest"),
+                InlineKeyboardButton(text="🍽 Рестораны и Гастробары", callback_data="hunt:niche:rest"),
                 InlineKeyboardButton(text="🍸 Бары и Лаунжи", callback_data="hunt:niche:bar"),
             ],
             [
@@ -182,7 +222,7 @@ def make_hunt_district_keyboard(niche_key: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="✨ Мирзо-Улугбек (Ц-1 / Паркентская)",
+                    text="✨ Мирзо-Улугбек (Ц-1 / Паркентская / Дархан)",
                     callback_data=f"hunt:run:{niche_key}:mirzo",
                 )
             ],
@@ -202,28 +242,8 @@ def make_hunt_district_keyboard(niche_key: str) -> InlineKeyboardMarkup:
     )
 
 
-def make_hunt_more_keyboard(niche_key: str, district_key: str) -> InlineKeyboardMarkup:
-    """Кнопки под пачкой найденных лидов для продолжения охоты."""
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔥 Найти ещё 5 горячих лидов в этом секторе",
-                    callback_data=f"hunt:run:{niche_key}:{district_key}",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="🧭 Сменить нишу или район",
-                    callback_data="hunt:menu",
-                )
-            ],
-        ]
-    )
-
-
 def format_place_card(place: PlaceInfo) -> str:
-    """Форматирует стандартную карточку заведения."""
+    """Форматирует стандартную карточку заведения (для ручного поиска)."""
     rating_part = ""
     if place.rating is not None:
         rating_part = f"⭐️ {place.rating:.1f}"
@@ -241,12 +261,16 @@ def format_place_card(place: PlaceInfo) -> str:
     return card
 
 
-def format_scored_lead_card(lead: ScoredLead, rank: int) -> str:
+def format_carousel_slide(batch: HuntCarouselBatch, idx: int) -> str:
     """
-    Форматирует обогащённую карточку горячего лида из Автопоиска
-    с индексом потенциала (Score), категорией боли и расчётом нужных 5⭐️ отзывов.
+    Форматирует один слайд карусели ТОП-лидов в едином сообщении.
     """
+    total = len(batch.leads)
+    lead = batch.leads[idx]
     place = lead.place
+    niche_info = HUNT_NICHES.get(batch.niche_key, HUNT_NICHES["all"])
+    district_info = HUNT_DISTRICTS.get(batch.district_key, HUNT_DISTRICTS["auto"])
+
     if place.rating is not None:
         rating_part = f"⭐️ {place.rating:.1f}"
         if place.user_ratings_total is not None:
@@ -255,22 +279,98 @@ def format_scored_lead_card(lead: ScoredLead, rank: int) -> str:
         rating_part = "⭐️ Мало оценок"
 
     return (
-        f"🏆 <b>ТОП-{rank} | Потенциал: {lead.score}/100</b> — {html.escape(lead.tier_badge)}\n"
+        f"🎯 <b>{html.escape(niche_info['short'])} • {html.escape(district_info['short'])}</b> "
+        f"<i>(просканировано: {batch.scanned_total})</i>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🏆 <b>ТОП-{idx + 1} из {total} | Оценка лида: {lead.score}/100</b>\n"
+        f"🏷 <b>Статус:</b> {html.escape(lead.tier_badge)}\n\n"
         f"🏢 <b>{html.escape(place.name)}</b> ({rating_part})\n"
         f"📍 <i>{html.escape(place.address)}</i>\n\n"
-        f"💡 <b>Почему купят:</b> {html.escape(lead.why_hot)}\n\n"
+        f"💡 <b>Почему купят:</b>\n{html.escape(lead.why_hot)}\n\n"
         f"🔗 <b>Ссылка для NFC Tools (тапни для копирования):</b>\n"
         f"<code>{place.review_url}</code>"
     )
 
 
+def make_carousel_keyboard(batch: HuntCarouselBatch, idx: int) -> InlineKeyboardMarkup:
+    """
+    Создаёт клавиатуру для текущего слайда карусели:
+    - Все кнопки работы с заведением (Проверить ссылку, Инста, Телеграм, ГС, Возражения)
+    - Стрелки перелистывания ⬅️ [ 1 / 5 ] ➡️
+    - Кнопка добора следующих 5 новых лидов и смены района
+    """
+    total = len(batch.leads)
+    lead = batch.leads[idx]
+    short_id = cache_place(lead.place, batch_id=batch.batch_id, slide_idx=idx)
+
+    # Строка навигации со стрелками влево/вправо
+    nav_row: List[InlineKeyboardButton] = []
+    if idx > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="⬅️ Предыдущий",
+                callback_data=f"hunt:page:{batch.batch_id}:{idx - 1}",
+            )
+        )
+    nav_row.append(
+        InlineKeyboardButton(
+            text=f"📍 {idx + 1} из {total}",
+            callback_data="hunt:noop",
+        )
+    )
+    if idx < total - 1:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="Следующий ➡️",
+                callback_data=f"hunt:page:{batch.batch_id}:{idx + 1}",
+            )
+        )
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔍 Проверить ссылку (5⭐️)",
+                    url=lead.place.review_url,
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📸 Инста Direct",
+                    callback_data=f"ai:{short_id}:insta",
+                ),
+                InlineKeyboardButton(
+                    text="✈️ Телеграм (под видео)",
+                    callback_data=f"ai:{short_id}:tg",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎤 Текст для ГС/Кружка",
+                    callback_data=f"ai:{short_id}:voice",
+                ),
+                InlineKeyboardButton(
+                    text="🛡 Отработать возражение",
+                    callback_data=f"ai:{short_id}:obj_menu",
+                ),
+            ],
+            nav_row,
+            [
+                InlineKeyboardButton(
+                    text="🔥 Ещё 5 новых лидов",
+                    callback_data=f"hunt:run:{batch.niche_key}:{batch.district_key}",
+                ),
+                InlineKeyboardButton(
+                    text="🧭 Сменить район",
+                    callback_data="hunt:menu",
+                ),
+            ],
+        ]
+    )
+
+
 def make_place_keyboard(place: PlaceInfo) -> InlineKeyboardMarkup:
-    """
-    Создает Inline-меню под карточкой заведения:
-    Row 1: [🔍 Проверить ссылку]
-    Row 2: [📸 Инста Direct] | [✈️ Телеграм (под видео)]
-    Row 3: [🎤 Текст для ГС/Кружка] | [🛡 Отработать возражение]
-    """
+    """Создает Inline-меню под одиночной карточкой заведения (при ручном поиске)."""
     short_id = cache_place(place)
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -335,7 +435,7 @@ def make_objections_keyboard(short_id: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
-                    text="⬅️ Назад",
+                    text="⬅️ Назад к карточке",
                     callback_data=f"ai:{short_id}:back_main",
                 )
             ],
@@ -347,7 +447,7 @@ def make_objections_keyboard(short_id: str) -> InlineKeyboardMarkup:
 def make_ai_response_keyboard(short_id: str, action: str) -> InlineKeyboardMarkup:
     """
     Кнопки под сгенерированным ИИ сообщением:
-    [🔄 Перегенерировать] | [⬅️ К меню заведения]
+    [🔄 Перегенерировать] | [⬅️ Скрыть сообщение]
     """
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -452,8 +552,8 @@ async def cmd_start(message: Message):
         f"{ai_desc}\n\n"
         "🎯 <b>ГЛАВНАЯ ФИЧА — Автопоиск ТОП-лидов:</b>\n"
         "Нажмите кнопку <b>«🎯 Автопоиск ТОП-лидов»</b> или <b>«🔥 Быстрый рейд»</b> внизу экрана — "
-        "бот сам просканирует улицы Ташкента, посчитает математику рейтинга и выдаст 5 самых горячих заведений "
-        "(где просел рейтинг или мало отзывов), которым NFC-карта нужна прямо сейчас.\n\n"
+        "бот сам просканирует улицы Ташкента, отберёт 5 самых горячих заведений и покажет их "
+        "<b>в одном удобном сообщении с перелистыванием ⬅️ ➡️</b> и защитой от повторов!\n\n"
         "🔎 <b>Ручной режим также работает:</b>\n"
         "• Отправьте название и улицу (<i>Жигули Бар Ташкент</i>)\n"
         "• Или ссылку из Google Maps (<code>https://maps.app.goo.gl/...</code>)\n"
@@ -473,10 +573,10 @@ async def cmd_hunt_menu(message: Message):
     seen = lead_hunter_service.seen_count()
     text = (
         "🎯 <b>Автопоиск самых горячих лидов HHtap</b>\n\n"
-        "Бот просканирует карточки заведений в Гугл Картах, отсеет столовые/магазины и уже просмотренные точки "
-        f"(в базе просмотренных сейчас: <b>{seen}</b>) и отберёт <b>ТОП-5 клиентов</b> по двум главным критериям:\n"
-        "1️⃣ <b>Острая боль (3.5–4.4⭐️):</b> старые оценки тянут точку вниз, нужно срочно перекрыть пятёрками.\n"
-        "2️⃣ <b>Огромный потенциал (4.5–5.0⭐️, но мало отзывов):</b> сильное место с полупустой карточкой.\n\n"
+        "Бот просканирует улицы Ташкента, отсеет уже показанные точки "
+        f"(в памяти сейчас: <b>{seen}</b> уникальных заведений) и соберёт <b>карусель из ТОП-5 клиентов</b>:\n"
+        "• 🚀 <b>Огромный потенциал (4.5–5.0⭐️, но мало отзывов)</b>\n"
+        "• 🔥 <b>Острая боль (просажен рейтинг 3.5–4.4⭐️)</b>\n\n"
         "👇 <b>Выберите нишу заведений:</b>"
     )
     await message.answer(
@@ -489,7 +589,7 @@ async def cmd_hunt_menu(message: Message):
 @router.message(F.text == BTN_QUICK_RAID)
 async def handle_quick_raid(message: Message):
     """Мгновенный запуск поиска ТОП-5 лидов по всем денежным улицам Ташкента в 1 клик."""
-    await execute_lead_hunt(message, niche_key="all", district_key="auto")
+    await execute_lead_hunt(message, niche_key="all", district_key="auto", edit_existing=False)
 
 
 @router.message(F.text == BTN_STATS)
@@ -497,15 +597,19 @@ async def handle_stats_info(message: Message):
     """Показывает статистику базы и логику скоринга."""
     seen = lead_hunter_service.seen_count()
     text = (
-        "📊 <b>Статистика и алгоритм оценки лидов HHtap</b>\n\n"
-        f"🗂 <b>Уже обработано (в анти-дубль базе):</b> <code>{seen}</code> заведений.\n\n"
-        "🧠 <b>Как бот считает Потенциал (0–99 баллов):</b>\n"
-        "• <b>90–99 баллов (🔥 Острая боль):</b> рейтинг <code>3.5–4.4⭐️</code> при <code>10–180</code> отзывах. "
-        "Бот по точной формуле считает, сколько именно 5⭐️ оценок им не хватает до <code>4.5⭐️</code>, и переводит это в количество рабочих смен с NFC-картой.\n"
-        "• <b>85–97 баллов (🚀 Высокий потенциал, мало отзывов):</b> рейтинг <code>4.5–5.0⭐️</code>, но меньше <code>65</code> отзывов. "
-        "Владелец вложился в продукт, гости довольны, но карточка проигрывает соседям по числу оценок.\n"
-        "• <b>75–84 балла (💎 Борьба за ТОП):</b> крепкие точки с <code>66–220</code> отзывами, которым нужно обогнать лидеров своей улицы без QR-наклеек.\n"
-        "• <b>Авто-фильтр мусора:</b> столовые, хот-доги, магазины, аптеки, госучреждения и гиганты с <code>450+</code> отзывами отсекаются автоматически."
+        "📊 <b>Память бота и многофакторный алгоритм оценки (0–98 баллов)</b>\n\n"
+        f"🗂 <b>В анти-дубль памяти (уже просмотрено):</b> <code>{seen}</code> заведений.\n"
+        "<i>Бот запоминает каждое показанное заведение по Place ID и названию, поэтому даже после 10–15 нажатий подряд в одном районе он углубляется по десяткам улиц и не присылает дубли.</i>\n\n"
+        "🧠 <b>Из чего складывается точный балл лида:</b>\n"
+        "1️⃣ <b>Острота боли и потенциал (до 55 баллов):</b>\n"
+        "   • Просаженный рейтинг <code>3.9–4.3⭐️</code> (чуть ниже порога 4.5⭐️)\n"
+        "   • Или высокий рейтинг <code>4.6–5.0⭐️</code> при малом числе отзывов (<code>6–40</code> отз.)\n"
+        "2️⃣ <b>Скорость окупаемости в сменах (до 18 баллов):</b>\n"
+        "   • Чем быстрее заведение выйдет на <code>4.5⭐️</code> или первую сотню отзывов с нашей NFC-картой (за 2–4 смены), тем выше балл.\n"
+        "3️⃣ <b>Платёжеспособность формата (до 13 баллов):</b>\n"
+        "   • Рестораны, стейк-хаусы, бары, лаунжи, кофейни, стоматологии и барбершопы получают приоритет.\n"
+        "4️⃣ <b>Трафик и престижность улицы (до 12 баллов):</b>\n"
+        "   • Денежные локации (Т. Шевченко, Ойбек, Ш. Руставели, Ц-1, Tashkent City, Seoul Mun и др.) получают бонус за плотность конкуренции."
     )
     await message.answer(text, parse_mode=ParseMode.HTML, reply_markup=make_main_reply_keyboard())
 
@@ -515,9 +619,9 @@ async def handle_reset_seen(message: Message):
     """Очищает базу просмотренных заведений."""
     cleared = lead_hunter_service.reset_seen()
     await message.answer(
-        f"🔄 <b>История просмотренных лидов очищена!</b>\n"
-        f"Удалено записей из фильтра повторов: <code>{cleared}</code>.\n"
-        f"Теперь все заведения Ташкента снова доступны для выдачи.",
+        f"🔄 <b>Память просмотренных заведений очищена!</b>\n"
+        f"Удалено записей из анти-дубль фильтра: <code>{cleared}</code>.\n"
+        f"Теперь все локации снова доступны с чистого листа.",
         parse_mode=ParseMode.HTML,
         reply_markup=make_main_reply_keyboard(),
     )
@@ -525,15 +629,50 @@ async def handle_reset_seen(message: Message):
 
 @router.callback_query(F.data.startswith("hunt:"))
 async def handle_hunt_callbacks(callback: CallbackQuery):
-    """Обрабатывает навигацию по меню Автопоиска и запуск сканирования."""
+    """Обрабатывает перелистывание карусели (⬅️ ➡️), выбор ниши/района и запуск охоты."""
     parts = callback.data.split(":")
     action = parts[1] if len(parts) > 1 else "menu"
+
+    if action == "noop":
+        await callback.answer("Используйте стрелки ⬅️ и ➡️ для перелистывания ТОП-5")
+        return
+
+    # Перелистывание слайдов ТОП-1 .. ТОП-5 внутри одного сообщения
+    if action == "page" and len(parts) >= 4:
+        batch_id = parts[2]
+        try:
+            slide_idx = int(parts[3])
+        except ValueError:
+            await callback.answer()
+            return
+
+        batch = carousel_cache.get(batch_id)
+        if not batch or not (0 <= slide_idx < len(batch.leads)):
+            await callback.answer(
+                "⚠️ Эта подборка устарела. Нажмите «🔥 Ещё 5 новых лидов».",
+                show_alert=True,
+            )
+            return
+
+        slide_html = format_carousel_slide(batch, slide_idx)
+        kb = make_carousel_keyboard(batch, slide_idx)
+        try:
+            await callback.message.edit_text(
+                slide_html,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+        await callback.answer(f"ТОП-{slide_idx + 1} из {len(batch.leads)}")
+        return
 
     if action == "menu":
         seen = lead_hunter_service.seen_count()
         text = (
             "🎯 <b>Автопоиск самых горячих лидов HHtap</b>\n"
-            f"<i>В базе просмотренных: {seen} точек</i>\n\n"
+            f"<i>В анти-дубль памяти: {seen} точек</i>\n\n"
             "👇 <b>Выберите нишу заведений:</b>"
         )
         await callback.message.edit_text(
@@ -562,11 +701,12 @@ async def handle_hunt_callbacks(callback: CallbackQuery):
     if action == "run" and len(parts) >= 4:
         niche_key = parts[2]
         district_key = parts[3]
-        await callback.answer("🕵️‍♂️ Запускаю сканирование карт и отбор ТОП-лидов...")
+        await callback.answer("🕵️‍♂️ Ищу 5 новых горячих лидов без повторов...")
         await execute_lead_hunt(
             callback.message,
             niche_key=niche_key,
             district_key=district_key,
+            edit_existing=True,
         )
         return
 
@@ -575,18 +715,32 @@ async def execute_lead_hunt(
     message: Message,
     niche_key: str = "all",
     district_key: str = "auto",
+    edit_existing: bool = False,
 ):
-    """Запускает парсер + скоринг + ИИ-фильтр и отправляет карточки ТОП-5 лидов."""
+    """
+    Запускает парсер + многофакторный скоринг и выводит ТОП-5 лидов
+    В ОДНОМ сообщении с инлайн-кнопками перелистывания (⬅️ ➡️).
+    """
     niche_info = HUNT_NICHES.get(niche_key, HUNT_NICHES["all"])
     district_info = HUNT_DISTRICTS.get(district_key, HUNT_DISTRICTS["auto"])
+    seen_before = lead_hunter_service.seen_count()
 
-    status_msg = await message.answer(
-        f"🕵️‍♂️ <b>Охота за лидами запущена!</b>\n"
+    loading_text = (
+        f"🕵️‍♂️ <b>Сканирую улицы и отбираю свежие ТОП-5 лидов...</b>\n"
         f"• <b>Ниша:</b> {niche_info['title']}\n"
-        f"• <b>Локация:</b> {district_info['title']}\n\n"
-        f"⏳ <i>Сканирую выдачу Гугл Карт, отсеиваю нецелевые точки и считаю математику 5⭐️ отзывов...</i>",
-        parse_mode=ParseMode.HTML,
+        f"• <b>Локация:</b> {district_info['title']}\n"
+        f"• <b>Уже в памяти (исключены из повторов):</b> {seen_before} точек\n\n"
+        f"⏳ <i>Считаю математику 5⭐️ отзывов и проверяю карточки...</i>"
     )
+
+    if edit_existing:
+        try:
+            await message.edit_text(loading_text, parse_mode=ParseMode.HTML)
+            status_msg = message
+        except Exception:
+            status_msg = await message.answer(loading_text, parse_mode=ParseMode.HTML)
+    else:
+        status_msg = await message.answer(loading_text, parse_mode=ParseMode.HTML)
 
     async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
         try:
@@ -605,36 +759,29 @@ async def execute_lead_hunt(
 
     if not leads:
         await status_msg.edit_text(
-            "🔍 <b>Новых подходящих лидов в этом узком секторе не найдено.</b>\n\n"
-            "Попробуйте выбрать другой район или нажмите «🔄 Сбросить просмотренные».",
+            "🔍 <b>Все подходящие заведения по этим улицам уже были показаны ранее!</b>\n\n"
+            "Выберите другой район/нишу или нажмите <b>«🔄 Сбросить просмотренные»</b> внизу экрана.",
             parse_mode=ParseMode.HTML,
             reply_markup=make_hunt_niche_keyboard(),
         )
         return
 
-    await status_msg.edit_text(
-        f"✅ <b>Готово! Просканировано карточек: {scanned_total}</b>\n"
-        f"Отобрано <b>ТОП-{len(leads)} самых горячих заведений</b> "
-        f"({niche_info['short']} — {district_info['short']}):",
-        parse_mode=ParseMode.HTML,
+    batch_id = cache_carousel_batch(
+        niche_key=niche_key,
+        district_key=district_key,
+        scanned_total=scanned_total,
+        leads=leads,
     )
+    batch = carousel_cache[batch_id]
 
-    for idx, scored_lead in enumerate(leads, start=1):
-        card_html = format_scored_lead_card(scored_lead, rank=idx)
-        kb = make_place_keyboard(scored_lead.place)
-        await message.answer(
-            card_html,
-            reply_markup=kb,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
-        )
+    first_slide_html = format_carousel_slide(batch, idx=0)
+    first_slide_kb = make_carousel_keyboard(batch, idx=0)
 
-    await message.answer(
-        f"👆 <b>Нажмите на любую кнопку под карточкой выше</b>, чтобы мгновенно сгенерировать плотный питч "
-        f"(Инста / Телеграм / ГС) с учётом цифр этого заведения.\n\n"
-        f"Хотите ещё пачку свежих лидов без повторов?",
+    await status_msg.edit_text(
+        first_slide_html,
         parse_mode=ParseMode.HTML,
-        reply_markup=make_hunt_more_keyboard(niche_key, district_key),
+        reply_markup=first_slide_kb,
+        disable_web_page_preview=True,
     )
 
 
@@ -643,10 +790,10 @@ async def cmd_help(message: Message):
     """Справка и инструкция по записи NFC Tools."""
     text = (
         "📖 <b>Инструкция для команды HHtap</b>\n\n"
-        "<b>1. Автопоиск горячих лидов:</b>\n"
+        "<b>1. Автопоиск горячих лидов (в одном окне):</b>\n"
         "• Нажмите <b>«🎯 Автопоиск ТОП-лидов»</b> или <b>«🔥 Быстрый рейд»</b>.\n"
-        "• Бот сам просканирует выбранный район Ташкента, рассчитает сколько пятёрок не хватает каждой точке, "
-        "и выдаст ТОП-5 заведений с самым высоким потенциалом покупки.\n\n"
+        "• Листайте найденные 5 заведений кнопками <b>⬅️ Предыдущий / Следующий ➡️</b> прямо в одном сообщении.\n"
+        "• Все показанные точки автоматически запоминаются и не повторяются.\n\n"
         "<b>2. Запись чипа в NFC Tools:</b>\n"
         "• Нажмите <b>«🔍 Проверить ссылку»</b>, чтобы убедиться, что открывается окно с 5 звёздами.\n"
         "• Тапните по ссылке в сообщении — она скопируется в буфер.\n"
@@ -693,21 +840,27 @@ async def handle_ai_callbacks(callback: CallbackQuery):
         await callback.answer()
         return
 
-    # 2. Возврат в главное меню карточки заведения
+    # 2. Возврат в главное меню карточки заведения (с сохранением карусели, если это слайд ТОП-5)
     if action == "back_main":
         cached = place_cache.get(short_id)
         if cached:
-            dummy = PlaceInfo(
-                place_id=cached.place_id,
-                name=cached.name,
-                address=cached.address,
-                rating=cached.rating,
-                user_ratings_total=cached.reviews_count,
-                review_url=cached.review_link,
-            )
-            await callback.message.edit_reply_markup(
-                reply_markup=make_place_keyboard(dummy)
-            )
+            if cached.batch_id and cached.slide_idx is not None and cached.batch_id in carousel_cache:
+                batch = carousel_cache[cached.batch_id]
+                await callback.message.edit_reply_markup(
+                    reply_markup=make_carousel_keyboard(batch, cached.slide_idx)
+                )
+            else:
+                dummy = PlaceInfo(
+                    place_id=cached.place_id,
+                    name=cached.name,
+                    address=cached.address,
+                    rating=cached.rating,
+                    user_ratings_total=cached.reviews_count,
+                    review_url=cached.review_link,
+                )
+                await callback.message.edit_reply_markup(
+                    reply_markup=make_place_keyboard(dummy)
+                )
         await callback.answer()
         return
 
@@ -730,7 +883,7 @@ async def handle_ai_callbacks(callback: CallbackQuery):
     cached = place_cache.get(short_id)
     if not cached:
         await callback.answer(
-            "⚠️ Данные точки устарели. Пожалуйста, отправьте запрос заново.",
+            "⚠️ Данные точки устарели. Пожалуйста, запустите поиск заново.",
             show_alert=True,
         )
         return
