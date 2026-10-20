@@ -88,6 +88,8 @@ class PlaceInfo:
     google_maps_url: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    phone: Optional[str] = None
+    website: Optional[str] = None
 
     @classmethod
     def from_places_new(cls, item: Dict[str, Any]) -> "PlaceInfo":
@@ -110,6 +112,8 @@ class PlaceInfo:
 
         review_url = build_review_url(clean_id)
         maps_url = item.get("googleMapsUri")
+        phone = item.get("internationalPhoneNumber") or item.get("nationalPhoneNumber")
+        website = item.get("websiteUri")
 
         return cls(
             place_id=clean_id,
@@ -121,6 +125,8 @@ class PlaceInfo:
             google_maps_url=maps_url,
             latitude=lat,
             longitude=lng,
+            phone=phone,
+            website=website,
         )
 
     @classmethod

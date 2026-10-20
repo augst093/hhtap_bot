@@ -106,6 +106,69 @@ class KeylessPlacesService:
             return []
         return raw_items[:max_results]
 
+    async def _fetch_details_via_sdk(self, place_ids: List[str]) -> Dict[str, Dict[str, Optional[str]]]:
+        """
+        Параллельно (через Promise.all за 0.2 сек) вытаскивает телефоны и сайты/Инстаграмы
+        для списка place_id из карточки Google Maps.
+        """
+        if not place_ids:
+            return {}
+        page = await self._ensure_page()
+        raw_details = await page.evaluate(
+            """(pids) => Promise.all(pids.map(pid => new Promise((resolve) => {
+                try {
+                    if (!window.google || !google.maps || !google.maps.places) {
+                        return resolve({ pid, phone: null, website: null });
+                    }
+                    const svc = new google.maps.places.PlacesService(document.createElement('div'));
+                    svc.getDetails(
+                        { placeId: pid, fields: ['formatted_phone_number', 'international_phone_number', 'website'] },
+                        (place, status) => {
+                            if (status !== 'OK' || !place) {
+                                return resolve({ pid, phone: null, website: null });
+                            }
+                            resolve({
+                                pid,
+                                phone: place.international_phone_number || place.formatted_phone_number || null,
+                                website: place.website || null,
+                            });
+                        }
+                    );
+                } catch (e) {
+                    resolve({ pid, phone: null, website: null });
+                }
+            })))""",
+            place_ids,
+        )
+        out: Dict[str, Dict[str, Optional[str]]] = {}
+        if isinstance(raw_details, list):
+            for d in raw_details:
+                pid = d.get("pid")
+                if pid:
+                    out[pid] = {
+                        "phone": d.get("phone"),
+                        "website": d.get("website"),
+                    }
+        return out
+
+    async def enrich_places_contacts(self, places: List[PlaceInfo]) -> None:
+        """Обогащает список объектов PlaceInfo номерами телефонов и сайтами/Инстаграмами."""
+        pids = [p.place_id for p in places if p.place_id and not p.phone]
+        if not pids:
+            return
+        async with self._lock:
+            try:
+                details_map = await self._fetch_details_via_sdk(pids)
+                for p in places:
+                    info = details_map.get(p.place_id)
+                    if info:
+                        if info.get("phone"):
+                            p.phone = info["phone"]
+                        if info.get("website"):
+                            p.website = info["website"]
+            except Exception as e:
+                logger.warning("Не удалось обогатить контакты для точек: %s", e)
+
     async def search_batch_raw(self, query: str, max_results: int = 20) -> List[Dict[str, Any]]:
         """
         Массовый поиск заведений по запросу (для Автопоиска ТОП-лидов).
@@ -126,7 +189,7 @@ class KeylessPlacesService:
     async def search_text(self, query: str, max_results: int = 3) -> List[PlaceInfo]:
         """
         Ищет заведение по текстовому названию и возвращает список найденных точек
-        с Place ID, реальным рейтингом и количеством отзывов.
+        с Place ID, реальным рейтингом, количеством отзывов, телефоном и сайтом.
         """
         clean_query = query.strip()
         if not clean_query:
@@ -159,7 +222,14 @@ class KeylessPlacesService:
                             )
                         )
                     if results:
-                        return results[:max_results]
+                        top_res = results[:max_results]
+                        details_map = await self._fetch_details_via_sdk([p.place_id for p in top_res])
+                        for p in top_res:
+                            info = details_map.get(p.place_id)
+                            if info:
+                                p.phone = info.get("phone")
+                                p.website = info.get("website")
+                        return top_res
 
                 # 2. Fallback на Autocomplete (#pac-input), если textSearch ничего не вернул
                 page = await self._ensure_page()

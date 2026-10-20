@@ -35,10 +35,13 @@ from services.google_places import (
 )
 from services.keyless_places import keyless_places_service
 from services.lead_hunter import (
+    CRM_STATUSES,
     HUNT_DISTRICTS,
     HUNT_NICHES,
     ScoredLead,
+    build_insta_search_url,
     lead_hunter_service,
+    parse_uz_phone,
 )
 
 # Настройка логирования
@@ -70,6 +73,7 @@ OBJECTION_TITLES = {
 # Тексты кнопок нижнего меню
 BTN_HUNT_MENU = "🎯 Автопоиск ТОП-лидов"
 BTN_QUICK_RAID = "🔥 Быстрый рейд (Топ-5)"
+BTN_CRM = "📋 Мои сделки (CRM)"
 BTN_STATS = "📊 База и критерии"
 BTN_RESET_SEEN = "🔄 Сбросить просмотренные"
 
@@ -85,6 +89,11 @@ class CachedPlace:
     rating: Optional[float]
     reviews_count: Optional[int]
     review_link: str
+    phone: Optional[str] = None
+    website: Optional[str] = None
+    score: int = 85
+    tier_badge: str = "📌 В работе"
+    why_hot: str = ""
     batch_id: Optional[str] = None
     slide_idx: Optional[int] = None
 
@@ -106,10 +115,14 @@ def cache_place(
     place: PlaceInfo,
     batch_id: Optional[str] = None,
     slide_idx: Optional[int] = None,
+    score: int = 85,
+    tier_badge: str = "📌 В работе",
+    why_hot: str = "",
 ) -> str:
     """Сохраняет данные заведения в кэш и возвращает короткий 8-символьный хэш."""
     raw = f"{place.place_id}:{place.name}"
     short_id = hashlib.md5(raw.encode("utf-8")).hexdigest()[:8]
+    existing = place_cache.get(short_id)
     place_cache[short_id] = CachedPlace(
         place_id=place.place_id,
         name=place.name,
@@ -117,8 +130,13 @@ def cache_place(
         rating=place.rating,
         reviews_count=place.user_ratings_total,
         review_link=place.review_url,
-        batch_id=batch_id,
-        slide_idx=slide_idx,
+        phone=place.phone or (existing.phone if existing else None),
+        website=place.website or (existing.website if existing else None),
+        score=score or (existing.score if existing else 85),
+        tier_badge=tier_badge or (existing.tier_badge if existing else "📌 В работе"),
+        why_hot=why_hot or (existing.why_hot if existing else ""),
+        batch_id=batch_id if batch_id is not None else (existing.batch_id if existing else None),
+        slide_idx=slide_idx if slide_idx is not None else (existing.slide_idx if existing else None),
     )
     if len(place_cache) > 2000:
         oldest_key = next(iter(place_cache))
@@ -132,7 +150,7 @@ def cache_carousel_batch(
     scanned_total: int,
     leads: List[ScoredLead],
 ) -> str:
-    """Сохраняет пачку из 5 лидов для перелистывания в одном сообщении."""
+    """Сохраняет пачку лидов для перелистывания в одном сообщении."""
     batch_id = uuid.uuid4().hex[:8]
     carousel_cache[batch_id] = HuntCarouselBatch(
         batch_id=batch_id,
@@ -151,7 +169,7 @@ def cache_carousel_batch(
 # Клавиатуры и карточки
 # ==============================================================================
 def make_main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """Постоянное нижнее меню для запуска Автопоиска лидов в 1 клик."""
+    """Постоянное нижнее меню для запуска Автопоиска лидов и Мини-CRM в 1 клик."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [
@@ -159,7 +177,10 @@ def make_main_reply_keyboard() -> ReplyKeyboardMarkup:
                 KeyboardButton(text=BTN_QUICK_RAID),
             ],
             [
+                KeyboardButton(text=BTN_CRM),
                 KeyboardButton(text=BTN_STATS),
+            ],
+            [
                 KeyboardButton(text=BTN_RESET_SEEN),
             ],
         ],
@@ -242,8 +263,42 @@ def make_hunt_district_keyboard(niche_key: str) -> InlineKeyboardMarkup:
     )
 
 
+def format_contacts_and_crm_block(place: PlaceInfo) -> str:
+    """
+    Формирует блок прямых контактов (телефон, мобильный/ТГ, сайт/Instagram)
+    и текущего статуса сделки в Мини-CRM прямо внутри карточки.
+    """
+    lines: List[str] = []
+    p_info = parse_uz_phone(place.phone)
+    if p_info["raw"]:
+        if p_info["is_mobile"]:
+            lines.append(f"📱 <b>Мобильный (ТГ / Звонок):</b> <code>{html.escape(p_info['raw'])}</code>")
+        else:
+            lines.append(f"☎️ <b>Телефон (городской):</b> <code>{html.escape(p_info['raw'])}</code>")
+
+    if place.website:
+        w_clean = html.escape(place.website)
+        if "instagram.com" in place.website.lower():
+            lines.append(f"📸 <b>Instagram:</b> <a href=\"{w_clean}\">Открыть профиль</a>")
+        elif "t.me/" in place.website.lower():
+            lines.append(f"✈️ <b>Telegram:</b> <a href=\"{w_clean}\">Открыть канал/чат</a>")
+        else:
+            lines.append(f"🌐 <b>Сайт / Соцсети:</b> <a href=\"{w_clean}\">Перейти на сайт</a>")
+
+    crm_entry = lead_hunter_service.get_crm_entry(place.place_id)
+    if crm_entry:
+        st_label = crm_entry.get("status_label", "📌 В CRM")
+        upd = crm_entry.get("updated_at", "")
+        upd_part = f" <i>({html.escape(upd)})</i>" if upd else ""
+        lines.append(f"📌 <b>Статус в CRM:</b> <b>{html.escape(st_label)}</b>{upd_part}")
+
+    if not lines:
+        return ""
+    return "\n" + "\n".join(lines) + "\n"
+
+
 def format_place_card(place: PlaceInfo) -> str:
-    """Форматирует стандартную карточку заведения (для ручного поиска)."""
+    """Форматирует стандартную карточку заведения (для ручного поиска) с контактами и CRM."""
     rating_part = ""
     if place.rating is not None:
         rating_part = f"⭐️ {place.rating:.1f}"
@@ -252,9 +307,12 @@ def format_place_card(place: PlaceInfo) -> str:
     else:
         rating_part = "⭐️ Точка найдена"
 
+    contacts_block = format_contacts_and_crm_block(place)
+
     card = (
         f"🏢 <b>{html.escape(place.name)}</b> ({rating_part})\n"
-        f"📍 <i>{html.escape(place.address)}</i>\n\n"
+        f"📍 <i>{html.escape(place.address)}</i>\n"
+        f"{contacts_block}\n"
         f"🔗 <b>Ссылка для NFC Tools (тапни для копирования):</b>\n"
         f"<code>{place.review_url}</code>"
     )
@@ -263,13 +321,28 @@ def format_place_card(place: PlaceInfo) -> str:
 
 def format_carousel_slide(batch: HuntCarouselBatch, idx: int) -> str:
     """
-    Форматирует один слайд карусели ТОП-лидов в едином сообщении.
+    Форматирует один слайд карусели ТОП-лидов (или карусели сделок CRM) в едином сообщении.
     """
     total = len(batch.leads)
     lead = batch.leads[idx]
     place = lead.place
-    niche_info = HUNT_NICHES.get(batch.niche_key, HUNT_NICHES["all"])
-    district_info = HUNT_DISTRICTS.get(batch.district_key, HUNT_DISTRICTS["auto"])
+
+    if batch.niche_key == "crm":
+        filter_titles = {
+            "all": "Все активные сделки",
+            "contacted": "⏳ Написали (Ждём ответ)",
+            "meeting": "🤝 Заехать на 2-мин показ",
+            "won": "💰 Купили карту",
+        }
+        f_title = filter_titles.get(batch.district_key, "Все сделки")
+        header_line = f"📋 <b>Мини-CRM HHtap • {html.escape(f_title)}</b>"
+    else:
+        niche_info = HUNT_NICHES.get(batch.niche_key, HUNT_NICHES["all"])
+        district_info = HUNT_DISTRICTS.get(batch.district_key, HUNT_DISTRICTS["auto"])
+        header_line = (
+            f"🎯 <b>{html.escape(niche_info['short'])} • {html.escape(district_info['short'])}</b> "
+            f"<i>(просканировано: {batch.scanned_total})</i>"
+        )
 
     if place.rating is not None:
         rating_part = f"⭐️ {place.rating:.1f}"
@@ -278,14 +351,16 @@ def format_carousel_slide(batch: HuntCarouselBatch, idx: int) -> str:
     else:
         rating_part = "⭐️ Мало оценок"
 
+    contacts_block = format_contacts_and_crm_block(place)
+
     return (
-        f"🎯 <b>{html.escape(niche_info['short'])} • {html.escape(district_info['short'])}</b> "
-        f"<i>(просканировано: {batch.scanned_total})</i>\n"
+        f"{header_line}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"🏆 <b>ТОП-{idx + 1} из {total} | Оценка лида: {lead.score}/100</b>\n"
-        f"🏷 <b>Статус:</b> {html.escape(lead.tier_badge)}\n\n"
+        f"🏷 <b>Категория:</b> {html.escape(lead.tier_badge)}\n\n"
         f"🏢 <b>{html.escape(place.name)}</b> ({rating_part})\n"
-        f"📍 <i>{html.escape(place.address)}</i>\n\n"
+        f"📍 <i>{html.escape(place.address)}</i>\n"
+        f"{contacts_block}\n"
         f"💡 <b>Почему купят:</b>\n{html.escape(lead.why_hot)}\n\n"
         f"🔗 <b>Ссылка для NFC Tools (тапни для копирования):</b>\n"
         f"<code>{place.review_url}</code>"
@@ -295,14 +370,23 @@ def format_carousel_slide(batch: HuntCarouselBatch, idx: int) -> str:
 def make_carousel_keyboard(batch: HuntCarouselBatch, idx: int) -> InlineKeyboardMarkup:
     """
     Минималистичная и эстетичная клавиатура слайда карусели:
-    Ряд 1: [ ✉️ Написать ] | [ 🔗 Ссылка 5⭐️ ]
-    Ряд 2: [ ⬅️ ] | [ 📍 1 из 5 ] | [ ➡️ ]
-    Ряд 3: [ ⚡️ Поиск и локации ]
-    Все питчи (Инста, ТГ, ГС, Возражения) и доп. настройки аккуратно раскрываются по клику.
+    Ряд 1: [ ✉️ Написать ] | [ 📞 Контакты и CRM ] | [ 🔗 5⭐️ ]
+    Ряд 2: [ ⬅️ ] | [ 📍 1 / 5 ] | [ ➡️ ]
+    Ряд 3: [ ⚡️ Поиск и локации ] (или фильтры CRM, если открыта CRM)
     """
     total = len(batch.leads)
     lead = batch.leads[idx]
-    short_id = cache_place(lead.place, batch_id=batch.batch_id, slide_idx=idx)
+    short_id = cache_place(
+        lead.place,
+        batch_id=batch.batch_id,
+        slide_idx=idx,
+        score=lead.score,
+        tier_badge=lead.tier_badge,
+        why_hot=lead.why_hot,
+    )
+
+    crm_entry = lead_hunter_service.get_crm_entry(lead.place.place_id)
+    crm_btn_text = "✅ Контакты и CRM" if crm_entry else "📞 Контакты и CRM"
 
     nav_row: List[InlineKeyboardButton] = []
     if idx > 0:
@@ -326,6 +410,22 @@ def make_carousel_keyboard(batch: HuntCarouselBatch, idx: int) -> InlineKeyboard
             )
         )
 
+    bottom_row: List[InlineKeyboardButton] = []
+    if batch.niche_key == "crm":
+        bottom_row.append(
+            InlineKeyboardButton(
+                text="🗂 Фильтр сделок CRM",
+                callback_data="crm:overview",
+            )
+        )
+    else:
+        bottom_row.append(
+            InlineKeyboardButton(
+                text="⚡️ Поиск и локации",
+                callback_data=f"hunt:ctrl:{batch.batch_id}:{idx}",
+            )
+        )
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -334,17 +434,16 @@ def make_carousel_keyboard(batch: HuntCarouselBatch, idx: int) -> InlineKeyboard
                     callback_data=f"ai:{short_id}:msg_menu",
                 ),
                 InlineKeyboardButton(
-                    text="🔗 Ссылка 5⭐️",
+                    text=crm_btn_text,
+                    callback_data=f"crm:{short_id}:menu",
+                ),
+                InlineKeyboardButton(
+                    text="🔗 5⭐️",
                     url=lead.place.review_url,
                 ),
             ],
             nav_row,
-            [
-                InlineKeyboardButton(
-                    text="⚡️ Поиск и локации",
-                    callback_data=f"hunt:ctrl:{batch.batch_id}:{idx}",
-                ),
-            ],
+            bottom_row,
         ]
     )
 
@@ -378,6 +477,8 @@ def make_hunt_ctrl_keyboard(batch: HuntCarouselBatch, idx: int) -> InlineKeyboar
 def make_place_keyboard(place: PlaceInfo) -> InlineKeyboardMarkup:
     """Минималистичное меню под одиночной карточкой заведения (при ручном поиске)."""
     short_id = cache_place(place)
+    crm_entry = lead_hunter_service.get_crm_entry(place.place_id)
+    crm_btn_text = "✅ Контакты и CRM" if crm_entry else "📞 Контакты и CRM"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -386,7 +487,11 @@ def make_place_keyboard(place: PlaceInfo) -> InlineKeyboardMarkup:
                     callback_data=f"ai:{short_id}:msg_menu",
                 ),
                 InlineKeyboardButton(
-                    text="🔗 Ссылка 5⭐️",
+                    text=crm_btn_text,
+                    callback_data=f"crm:{short_id}:menu",
+                ),
+                InlineKeyboardButton(
+                    text="🔗 5⭐️",
                     url=place.review_url,
                 ),
             ],
@@ -394,12 +499,104 @@ def make_place_keyboard(place: PlaceInfo) -> InlineKeyboardMarkup:
     )
 
 
+def make_contacts_crm_drawer_keyboard(short_id: str) -> InlineKeyboardMarkup:
+    """
+    Раскрывающееся меню «📞 Контакты и CRM» (Фича 1 + Фича 2):
+    - Прямые кнопки 1-клик в Telegram (+998...), WhatsApp и поиск Instagram/Сайта
+    - Кнопки Мини-CRM в 1 клик: [ ⏳ Написали ] | [ 🤝 На показ ] | [ 💰 Купили ]
+    """
+    cached = place_cache.get(short_id)
+    rows: List[List[InlineKeyboardButton]] = []
+
+    if cached:
+        p_info = parse_uz_phone(cached.phone)
+        # Если мобильный номер — даём прямые кнопки 1-клик в Telegram и WhatsApp
+        if p_info["is_mobile"] and p_info["tg_url"]:
+            messenger_row = [
+                InlineKeyboardButton(
+                    text=f"✈️ Открыть Telegram ({p_info['e164']})",
+                    url=p_info["tg_url"],
+                ),
+            ]
+            if p_info["wa_url"]:
+                messenger_row.append(
+                    InlineKeyboardButton(
+                        text="💬 WhatsApp",
+                        url=p_info["wa_url"],
+                    )
+                )
+            rows.append(messenger_row)
+
+        # Кнопка мгновенного перехода или поиска Instagram точки + Сайт
+        insta_label, insta_url = build_insta_search_url(cached.name, cached.website)
+        social_row = [
+            InlineKeyboardButton(
+                text=insta_label,
+                url=insta_url,
+            )
+        ]
+        if cached.website and "instagram.com" not in cached.website.lower():
+            social_row.append(
+                InlineKeyboardButton(
+                    text="🌐 Сайт точки",
+                    url=cached.website,
+                )
+            )
+        rows.append(social_row)
+
+        # Кнопки статусов Мини-CRM (с галочкой на текущем статусе)
+        crm_entry = lead_hunter_service.get_crm_entry(cached.place_id)
+        cur_status = crm_entry.get("status") if crm_entry else None
+
+        btn_contacted = "✅ ⏳ Написали" if cur_status == "contacted" else "⏳ Написали"
+        btn_meeting = "✅ 🤝 На показ" if cur_status == "meeting" else "🤝 На показ"
+        btn_won = "✅ 💰 Купили" if cur_status == "won" else "💰 Купили"
+
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=btn_contacted,
+                    callback_data=f"crm:{short_id}:set:contacted",
+                ),
+                InlineKeyboardButton(
+                    text=btn_meeting,
+                    callback_data=f"crm:{short_id}:set:meeting",
+                ),
+                InlineKeyboardButton(
+                    text=btn_won,
+                    callback_data=f"crm:{short_id}:set:won",
+                ),
+            ]
+        )
+
+        if crm_entry:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="🗑 Убрать из CRM",
+                        callback_data=f"crm:{short_id}:del",
+                    )
+                ]
+            )
+
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ Свернуть меню",
+                callback_data=f"ai:{short_id}:back_main",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def make_messages_drawer_keyboard(short_id: str) -> InlineKeyboardMarkup:
     """
     Раскрывающееся меню выбора формата сообщения (открывается по нажатию «✉️ Написать»):
     [ 📸 Инста Direct ] | [ ✈️ Телеграм (видео) ]
-    [ 🎤 Текст для ГС ] | [ 🛡 Возражения ]
-    [ ⬅️ Свернуть ]
+    [ 🎤 Текст для ГС ] | [ 🔔 Дожим (Молчат) ]
+    [ 🛡 Отработать возражение ]
+    [ ⬅️ Свернуть меню ]
     """
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -419,7 +616,13 @@ def make_messages_drawer_keyboard(short_id: str) -> InlineKeyboardMarkup:
                     callback_data=f"ai:{short_id}:voice",
                 ),
                 InlineKeyboardButton(
-                    text="🛡 Возражения",
+                    text="🔔 Дожим (Молчат)",
+                    callback_data=f"ai:{short_id}:followup",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🛡 Отработать возражение",
                     callback_data=f"ai:{short_id}:obj_menu",
                 ),
             ],
@@ -618,6 +821,203 @@ async def cmd_hunt_menu(message: Message):
 async def handle_quick_raid(message: Message):
     """Мгновенный запуск поиска ТОП-5 лидов по всем денежным улицам Ташкента в 1 клик."""
     await execute_lead_hunt(message, niche_key="all", district_key="auto", edit_existing=False)
+
+
+def make_crm_overview_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура фильтрации сделок в Мини-CRM."""
+    counts = lead_hunter_service.crm_counts()
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"📋 Все сделки ({counts['all']})",
+                    callback_data="crm:filter:all",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"⏳ Написали • Ждём ответ ({counts['contacted']})",
+                    callback_data="crm:filter:contacted",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"🤝 Заехать на 2-мин показ ({counts['meeting']})",
+                    callback_data="crm:filter:meeting",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"💰 Купили карту ({counts['won']})",
+                    callback_data="crm:filter:won",
+                )
+            ],
+        ]
+    )
+
+
+def format_crm_overview_text() -> str:
+    counts = lead_hunter_service.crm_counts()
+    return (
+        "📋 <b>Мини-CRM команды HHtap (Воронка сделок)</b>\n\n"
+        f"• ⏳ <b>Написали (Ждём ответ):</b> <code>{counts['contacted']}</code>\n"
+        f"• 🤝 <b>Заехать на 2-мин показ:</b> <code>{counts['meeting']}</code>\n"
+        f"• 💰 <b>Купили карту:</b> <code>{counts['won']}</code>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🗂 <b>Всего точек в работе:</b> <code>{counts['all']}</code>\n\n"
+        "💡 <i>Чтобы добавить заведение в CRM или написать ему в 1 клик, нажмите кнопку "
+        "<b>«📞 Контакты и CRM»</b> под любой карточкой.</i>\n\n"
+        "👇 <b>Выберите список для просмотра каруселью:</b>"
+    )
+
+
+@router.message(Command("crm"))
+@router.message(F.text == BTN_CRM)
+async def cmd_crm_menu(message: Message):
+    """Открывает панель Мини-CRM со сводкой и фильтрами по статусам сделок."""
+    await message.answer(
+        format_crm_overview_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=make_crm_overview_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("crm:"))
+async def handle_crm_callbacks(callback: CallbackQuery):
+    """Обработчик Мини-CRM и меню прямых контактов в 1 клик."""
+    parts = callback.data.split(":")
+    if len(parts) < 2:
+        await callback.answer()
+        return
+
+    # 1. Сводка Мини-CRM
+    if parts[1] == "overview":
+        await callback.message.edit_text(
+            format_crm_overview_text(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=make_crm_overview_keyboard(),
+        )
+        await callback.answer()
+        return
+
+    # 2. Открытие карусели сделок по фильтру (all / contacted / meeting / won)
+    if parts[1] == "filter" and len(parts) >= 3:
+        status_filter = parts[2]
+        leads = lead_hunter_service.list_crm_leads(status_filter=status_filter)
+        if not leads:
+            await callback.answer(
+                "В этой категории пока нет сохранённых точек. Отметьте статус под любой карточкой в «📞 Контакты и CRM»!",
+                show_alert=True,
+            )
+            return
+
+        batch_id = cache_carousel_batch(
+            niche_key="crm",
+            district_key=status_filter,
+            scanned_total=len(leads),
+            leads=leads,
+        )
+        batch = carousel_cache[batch_id]
+        slide_html = format_carousel_slide(batch, idx=0)
+        kb = make_carousel_keyboard(batch, idx=0)
+        await callback.message.edit_text(
+            slide_html,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+        await callback.answer(f"Открыто сделок: {len(leads)}")
+        return
+
+    # 3. Действия с конкретной точкой: crm:{short_id}:menu | set:{status} | del
+    short_id = parts[1]
+    sub_action = parts[2] if len(parts) >= 3 else "menu"
+    cached = place_cache.get(short_id)
+
+    if not cached:
+        await callback.answer(
+            "⚠️ Карточка устарела. Откройте поиск или CRM заново.",
+            show_alert=True,
+        )
+        return
+
+    if sub_action == "menu":
+        await callback.message.edit_reply_markup(
+            reply_markup=make_contacts_crm_drawer_keyboard(short_id)
+        )
+        await callback.answer()
+        return
+
+    if sub_action == "set" and len(parts) >= 4:
+        new_status = parts[3]
+        place_obj = PlaceInfo(
+            place_id=cached.place_id,
+            name=cached.name,
+            address=cached.address,
+            rating=cached.rating,
+            user_ratings_total=cached.reviews_count,
+            review_url=cached.review_link,
+            phone=cached.phone,
+            website=cached.website,
+        )
+        lead_hunter_service.set_crm_status(
+            place=place_obj,
+            status=new_status,
+            score=cached.score,
+            tier_badge=cached.tier_badge,
+            why_hot=cached.why_hot,
+        )
+        # Обновляем текст карточки (чтобы сразу появился бейдж CRM) и галочку на кнопке
+        try:
+            if cached.batch_id and cached.slide_idx is not None and cached.batch_id in carousel_cache:
+                batch = carousel_cache[cached.batch_id]
+                new_html = format_carousel_slide(batch, cached.slide_idx)
+            else:
+                new_html = format_place_card(place_obj)
+            await callback.message.edit_text(
+                new_html,
+                parse_mode=ParseMode.HTML,
+                reply_markup=make_contacts_crm_drawer_keyboard(short_id),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await callback.message.edit_reply_markup(
+                reply_markup=make_contacts_crm_drawer_keyboard(short_id)
+            )
+        label = CRM_STATUSES.get(new_status, new_status)
+        await callback.answer(f"✅ Сохранено в CRM: {label}")
+        return
+
+    if sub_action == "del":
+        lead_hunter_service.remove_crm_lead(cached.place_id)
+        place_obj = PlaceInfo(
+            place_id=cached.place_id,
+            name=cached.name,
+            address=cached.address,
+            rating=cached.rating,
+            user_ratings_total=cached.reviews_count,
+            review_url=cached.review_link,
+            phone=cached.phone,
+            website=cached.website,
+        )
+        try:
+            if cached.batch_id and cached.slide_idx is not None and cached.batch_id in carousel_cache:
+                batch = carousel_cache[cached.batch_id]
+                new_html = format_carousel_slide(batch, cached.slide_idx)
+            else:
+                new_html = format_place_card(place_obj)
+            await callback.message.edit_text(
+                new_html,
+                parse_mode=ParseMode.HTML,
+                reply_markup=make_contacts_crm_drawer_keyboard(short_id),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            await callback.message.edit_reply_markup(
+                reply_markup=make_contacts_crm_drawer_keyboard(short_id)
+            )
+        await callback.answer("🗑 Точка удалена из CRM")
+        return
 
 
 @router.message(F.text == BTN_STATS)
@@ -913,6 +1313,8 @@ async def handle_ai_callbacks(callback: CallbackQuery):
                     rating=cached.rating,
                     user_ratings_total=cached.reviews_count,
                     review_url=cached.review_link,
+                    phone=cached.phone,
+                    website=cached.website,
                 )
                 await callback.message.edit_reply_markup(
                     reply_markup=make_place_keyboard(dummy)

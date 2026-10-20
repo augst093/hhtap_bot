@@ -5,8 +5,10 @@ import math
 import random
 import re
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+from urllib.parse import quote_plus
 import httpx
 
 from config import config
@@ -18,6 +20,57 @@ logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 SEEN_FILE = DATA_DIR / "seen_leads.json"
+CRM_FILE = DATA_DIR / "crm_leads.json"
+
+CRM_STATUSES: Dict[str, str] = {
+    "contacted": "⏳ Написали (Ждём ответ)",
+    "meeting": "🤝 Заехать на 2-мин показ",
+    "won": "💰 Купили карту",
+}
+
+UZ_MOBILE_CODES = {"90", "91", "93", "94", "95", "97", "98", "99", "88", "77", "50", "33", "20"}
+
+
+def parse_uz_phone(phone: Optional[str]) -> Dict[str, Any]:
+    """
+    Разбирает телефон заведения в Узбекистане:
+    - Определяет мобильный номер (+998 90/91/93/94/95/97/98/99/88/77/50/33) или городской (71/78)
+    - Формирует прямые ссылки в 1 клик для Telegram (https://t.me/+998...) и WhatsApp (https://wa.me/998...)
+    """
+    if not phone:
+        return {"raw": None, "e164": None, "is_mobile": False, "tg_url": None, "wa_url": None}
+
+    digits = re.sub(r"\D+", "", phone)
+    if len(digits) == 9:
+        digits = "998" + digits
+    elif len(digits) == 12 and digits.startswith("998"):
+        pass
+    elif len(digits) < 9:
+        return {"raw": phone, "e164": None, "is_mobile": False, "tg_url": None, "wa_url": None}
+
+    e164 = f"+{digits}"
+    op_code = digits[3:5] if digits.startswith("998") and len(digits) >= 5 else ""
+    is_mobile = op_code in UZ_MOBILE_CODES
+
+    return {
+        "raw": phone.strip(),
+        "e164": e164,
+        "op_code": op_code,
+        "is_mobile": is_mobile,
+        "tg_url": f"https://t.me/{e164}" if is_mobile else None,
+        "wa_url": f"https://wa.me/{digits}" if is_mobile else None,
+    }
+
+
+def build_insta_search_url(name: str, website: Optional[str] = None) -> Tuple[str, str]:
+    """
+    Возвращает (текст кнопки, URL) для быстрого перехода в Instagram точки или поиска её страницы в 1 клик.
+    """
+    if website and "instagram.com" in website.lower():
+        return ("📸 Открыть Instagram точки", website)
+    clean_q = re.sub(r"[^\w\sа-яА-ЯёЁ-]", " ", name or "").strip()
+    search_q = quote_plus(f"{clean_q} Ташкент instagram")
+    return ("📸 Найти Instagram (1 клик)", f"https://www.google.com/search?q={search_q}")
 
 # ==============================================================================
 # Глубокая матрица ниш и улиц Ташкента (сотни уникальных комбинаций без повторов)
@@ -480,7 +533,9 @@ class LeadHunterService:
     def __init__(self) -> None:
         self._seen_ids: Set[str] = set()
         self._seen_names: Set[str] = set()
+        self._crm: Dict[str, Dict[str, Any]] = {}
         self._load_seen()
+        self._load_crm()
         self._query_decks: Dict[str, List[str]] = {}
 
     def _load_seen(self) -> None:
@@ -508,6 +563,114 @@ class LeadHunterService:
             )
         except Exception as e:
             logger.warning("Не удалось сохранить seen_leads.json: %s", e)
+
+    def _load_crm(self) -> None:
+        try:
+            if CRM_FILE.exists():
+                data = json.loads(CRM_FILE.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    self._crm = data
+        except Exception as e:
+            logger.warning("Не удалось загрузить crm_leads.json: %s", e)
+
+    def _save_crm(self) -> None:
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            CRM_FILE.write_text(
+                json.dumps(self._crm, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            logger.warning("Не удалось сохранить crm_leads.json: %s", e)
+
+    def set_crm_status(
+        self,
+        place: PlaceInfo,
+        status: str,
+        score: int = 85,
+        tier_badge: str = "📌 В работе (CRM)",
+        why_hot: str = "",
+    ) -> Dict[str, Any]:
+        """Сохраняет или обновляет статус точки в Мини-CRM в 1 клик."""
+        pid = place.place_id
+        existing = self._crm.get(pid, {})
+        entry = {
+            "place_id": pid,
+            "name": place.name,
+            "address": place.address,
+            "rating": place.rating,
+            "user_ratings_total": place.user_ratings_total,
+            "review_url": place.review_url,
+            "google_maps_url": place.google_maps_url or f"https://www.google.com/maps/place/?q=place_id:{pid}",
+            "phone": place.phone or existing.get("phone"),
+            "website": place.website or existing.get("website"),
+            "status": status,
+            "status_label": CRM_STATUSES.get(status, status),
+            "score": existing.get("score", score),
+            "tier_badge": existing.get("tier_badge", tier_badge),
+            "why_hot": why_hot or existing.get("why_hot") or "Точка сохранена в Мини-CRM для дожима и живого показа.",
+            "updated_at": datetime.now().strftime("%d.%m %H:%M"),
+        }
+        self._crm[pid] = entry
+        self._save_crm()
+        return entry
+
+    def remove_crm_lead(self, place_id: str) -> bool:
+        if place_id in self._crm:
+            del self._crm[place_id]
+            self._save_crm()
+            return True
+        return False
+
+    def get_crm_entry(self, place_id: str) -> Optional[Dict[str, Any]]:
+        return self._crm.get(place_id)
+
+    def list_crm_leads(self, status_filter: Optional[str] = None) -> List[ScoredLead]:
+        """Возвращает список лидов из CRM в виде ScoredLead для удобного просмотра в карусели."""
+        items = list(self._crm.values())
+        if status_filter and status_filter != "all":
+            items = [x for x in items if x.get("status") == status_filter]
+        # Свежие сверху
+        items.reverse()
+        out: List[ScoredLead] = []
+        for it in items:
+            pid = it.get("place_id", "")
+            r = it.get("rating")
+            rev = it.get("user_ratings_total")
+            needed_5, target_r = calc_5stars_needed(r, rev)
+            place = PlaceInfo(
+                place_id=pid,
+                name=it.get("name", "Заведение"),
+                address=it.get("address", "Ташкент"),
+                rating=r,
+                user_ratings_total=rev,
+                review_url=it.get("review_url") or build_review_url(pid),
+                google_maps_url=it.get("google_maps_url") or f"https://www.google.com/maps/place/?q=place_id:{pid}",
+                phone=it.get("phone"),
+                website=it.get("website"),
+            )
+            status_label = CRM_STATUSES.get(it.get("status", ""), "📌 В CRM")
+            updated_at = it.get("updated_at", "")
+            badge = f"{status_label}" + (f" • {updated_at}" if updated_at else "")
+            out.append(
+                ScoredLead(
+                    place=place,
+                    score=int(it.get("score") or 85),
+                    tier_badge=badge,
+                    why_hot=it.get("why_hot") or "Точка в воронке продаж HHtap.",
+                    needed_5stars=needed_5,
+                    target_rating=target_r,
+                )
+            )
+        return out
+
+    def crm_counts(self) -> Dict[str, int]:
+        counts = {"all": len(self._crm), "contacted": 0, "meeting": 0, "won": 0}
+        for v in self._crm.values():
+            st = v.get("status")
+            if st in counts:
+                counts[st] += 1
+        return counts
 
     def is_seen(self, place_id: str, name: str) -> bool:
         if place_id in self._seen_ids:
@@ -668,6 +831,12 @@ class LeadHunterService:
         refined = await self._ai_refine_top_leads(balanced_pool[:10])
         selected = refined[:top_n]
         selected.sort(key=lambda x: x.score, reverse=True)
+
+        # Обогащаем выбранные ТОП-5 прямыми контактами (телефон, сайт/Instagram) за ~0.2 сек
+        try:
+            await keyless_places_service.enrich_places_contacts([x.place for x in selected])
+        except Exception as e:
+            logger.warning("Не удалось обогатить контакты для ТОП-5: %s", e)
 
         # Записываем только те 5 заведений, которые реально отправляем в карусель пользователю
         self.mark_seen(selected)
