@@ -34,6 +34,13 @@ from services.google_places import (
     google_places_service,
 )
 from services.keyless_places import keyless_places_service
+from services.instagram_service import (
+    InstagramCardData,
+    InstagramParseError,
+    build_instagram_card_data,
+    format_instagram_card,
+    is_instagram_input,
+)
 from services.lead_hunter import (
     CRM_STATUSES,
     HUNT_DISTRICTS,
@@ -70,12 +77,17 @@ OBJECTION_TITLES = {
     "obj_think": "Скиньте КП, мы подумаем",
 }
 
-# Тексты кнопок нижнего меню
+# Тексты кнопок выбора режима и нижнего меню
+BTN_MODE_GOOGLE = "⭐️ Google Reviews NFC"
+BTN_MODE_INSTA = "📸 Instagram NFC"
 BTN_HUNT_MENU = "🎯 Автопоиск ТОП-лидов"
 BTN_QUICK_RAID = "🔥 Быстрый рейд (Топ-5)"
 BTN_CRM = "📋 Мои сделки (CRM)"
 BTN_STATS = "📊 База и критерии"
 BTN_RESET_SEEN = "🔄 Сбросить просмотренные"
+
+# Текущий выбранный режим пользователя: "google" (по умолчанию) или "insta"
+user_modes: Dict[int, str] = {}
 
 
 # ==============================================================================
@@ -169,9 +181,13 @@ def cache_carousel_batch(
 # Клавиатуры и карточки
 # ==============================================================================
 def make_main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """Постоянное нижнее меню для запуска Автопоиска лидов и Мини-CRM в 1 клик."""
+    """Постоянное нижнее меню с быстрым переключением режимов (Google Reviews / Instagram NFC) и Автопоиском."""
     return ReplyKeyboardMarkup(
         keyboard=[
+            [
+                KeyboardButton(text=BTN_MODE_GOOGLE),
+                KeyboardButton(text=BTN_MODE_INSTA),
+            ],
             [
                 KeyboardButton(text=BTN_HUNT_MENU),
                 KeyboardButton(text=BTN_QUICK_RAID),
@@ -185,6 +201,90 @@ def make_main_reply_keyboard() -> ReplyKeyboardMarkup:
             ],
         ],
         resize_keyboard=True,
+    )
+
+
+def make_start_mode_inline_keyboard() -> InlineKeyboardMarkup:
+    """Стартовое Inline-меню выбора режима работы бота."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="⭐️ Google Reviews NFC",
+                    callback_data="mode:google",
+                ),
+                InlineKeyboardButton(
+                    text="📸 Instagram NFC",
+                    callback_data="mode:insta",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎯 Запустить Автопоиск ТОП-лидов",
+                    callback_data="hunt:menu",
+                )
+            ],
+        ]
+    )
+
+
+def make_instagram_card_keyboard(clean_username: str) -> InlineKeyboardMarkup:
+    """
+    Inline-меню под результатом Instagram NFC-карты:
+    Row 1: [🔍 Проверить аккаунт] (URL -> https://instagram.com/{clean_username})
+    Row 2: [🎯 Питч для клиента (Текст)] | [🗣 Скрипт для живого разговора]
+    Row 3: [💥 Комбо-оффер (Google + Insta)]
+    Row 4: [⬅️ В главное меню]
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔍 Проверить аккаунт",
+                    url=f"https://instagram.com/{clean_username}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🎯 Питч для клиента (Текст)",
+                    callback_data=f"ig:ig_pitch:{clean_username}",
+                ),
+                InlineKeyboardButton(
+                    text="🗣 Скрипт для живого разговора",
+                    callback_data=f"ig:ig_live:{clean_username}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="💥 Комбо-оффер (Google + Insta)",
+                    callback_data=f"ig:ig_combo:{clean_username}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="⬅️ В главное меню",
+                    callback_data="mode:main",
+                )
+            ],
+        ]
+    )
+
+
+def make_instagram_ai_response_keyboard(clean_username: str, action: str) -> InlineKeyboardMarkup:
+    """Кнопки под сгенерированным ИИ текстом для Instagram NFC."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔄 Перегенерировать",
+                    callback_data=f"ig:r:{action}:{clean_username}",
+                ),
+                InlineKeyboardButton(
+                    text="⬅️ К карточке Instagram",
+                    callback_data="ig:hide",
+                ),
+            ]
+        ]
     )
 
 
@@ -763,9 +863,7 @@ async def admin_whitelist_callback_middleware(handler, event: CallbackQuery, dat
 # ==============================================================================
 # Команды бота и Автопоиск ТОП-лидов
 # ==============================================================================
-@router.message(CommandStart())
-async def cmd_start(message: Message):
-    """Приветственное сообщение, нижняя клавиатура и меню Автопоиска."""
+def format_main_welcome_text() -> str:
     mode_desc = (
         "🟢 <b>Режим парсера:</b> Google Places API"
         if config.has_google_api_key()
@@ -774,27 +872,207 @@ async def cmd_start(message: Message):
     ai_desc = (
         f"🤖 <b>ИИ-ассистент:</b> Подключен ({config.anymodel_model})"
         if config.has_anymodel_key()
-        else "🤖 <b>ИИ-ассистент:</b> Ожидает ключ ANYMODEL_API_KEY"
+        else "🤖 <b>ИИ-ассистент:</b> Встроенный Smart-генератор HHtap"
     )
-
-    text = (
+    return (
         "👋 <b>Добро пожаловать в комбайн лидогенерации HHtap!</b>\n\n"
         f"{mode_desc}\n"
         f"{ai_desc}\n\n"
-        "🎯 <b>ГЛАВНАЯ ФИЧА — Автопоиск ТОП-лидов:</b>\n"
-        "Нажмите кнопку <b>«🎯 Автопоиск ТОП-лидов»</b> или <b>«🔥 Быстрый рейд»</b> внизу экрана — "
-        "бот сам просканирует улицы Ташкента, отберёт 5 самых горячих заведений и покажет их "
-        "<b>в одном удобном сообщении с перелистыванием ⬅️ ➡️</b> и защитой от повторов!\n\n"
-        "🔎 <b>Ручной режим также работает:</b>\n"
-        "• Отправьте название и улицу (<i>Жигули Бар Ташкент</i>)\n"
-        "• Или ссылку из Google Maps (<code>https://maps.app.goo.gl/...</code>)\n"
-        "• Или геопозицию 📎"
+        "🧭 <b>ДВА РАБОЧИХ МОДУЛЯ БОТА:</b>\n"
+        "1️⃣ <b>⭐️ Google Reviews NFC:</b> автопоиск ТОП-5 заведений по улицам Ташкента, прямые 5⭐️ ссылки для NFC Tools, контакты и ИИ-питчи.\n"
+        "2️⃣ <b>📸 Instagram NFC:</b> генерация ссылок для NFC-карт под любой Instagram-аккаунт (<code>@username</code> или ссылка) + скрипты продаж и комбо-оффер.\n\n"
+        "💡 <i>Бот также поддерживает автоопределение: просто отправьте <code>@ник</code> или ссылку <code>instagram.com/...</code> либо название заведения!</i>"
+    )
+
+
+def format_insta_mode_prompt() -> str:
+    return (
+        "📸 <b>Режим: Instagram NFC</b>\n\n"
+        "Отправьте Instagram-аккаунт клиента в любом удобном формате:\n"
+        "• Чистый никнейм: <code>phoenix_math_school</code>\n"
+        "• Ник с собачкой: <code>@phoenix_math_school</code>\n"
+        "• Полную ссылку: <code>https://www.instagram.com/phoenix_math_school/</code>\n\n"
+        "⚡️ Бот мгновенно выдаст <b>2 готовые ссылки для записи в NFC Tools</b> "
+        "(основную с <code>igsh</code> для iOS/Android и прямой Deep Link) + кнопки генерации ИИ-питчей и Комбо-оффера!"
+    )
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    """Приветственное сообщение, нижняя клавиатура и стартовое меню выбора режима."""
+    if message.from_user:
+        user_modes[message.from_user.id] = "google"
+
+    await message.answer(
+        format_main_welcome_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=make_main_reply_keyboard(),
+    )
+    await message.answer(
+        "👇 <b>Выберите режим работы или просто отправьте запрос в чат:</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=make_start_mode_inline_keyboard(),
+    )
+
+
+@router.message(F.text == BTN_MODE_GOOGLE)
+async def handle_mode_google_btn(message: Message):
+    """Переключение в режим Google Reviews NFC."""
+    if message.from_user:
+        user_modes[message.from_user.id] = "google"
+
+    text = (
+        "⭐️ <b>Включён режим: Google Reviews NFC</b>\n\n"
+        "• Нажмите <b>«🎯 Автопоиск ТОП-лидов»</b> или <b>«🔥 Быстрый рейд»</b> внизу экрана\n"
+        "• Или отправьте название заведения и улицу (<i>Жигули Бар Ташкент</i>)\n"
+        "• Или ссылку из Google Maps (<code>https://maps.app.goo.gl/...</code>)"
     )
     await message.answer(
         text,
         parse_mode=ParseMode.HTML,
         reply_markup=make_main_reply_keyboard(),
     )
+
+
+@router.message(Command("insta"))
+@router.message(F.text == BTN_MODE_INSTA)
+async def handle_mode_insta_btn(message: Message):
+    """Переключение в режим Instagram NFC."""
+    if message.from_user:
+        user_modes[message.from_user.id] = "insta"
+
+    await message.answer(
+        format_insta_mode_prompt(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=make_main_reply_keyboard(),
+    )
+
+
+@router.callback_query(F.data.startswith("mode:"))
+async def handle_mode_callbacks(callback: CallbackQuery):
+    """Обработка Inline-кнопок переключения режима (mode:google, mode:insta, mode:main)."""
+    parts = callback.data.split(":")
+    target = parts[1] if len(parts) > 1 else "main"
+    user_id = callback.from_user.id if callback.from_user else 0
+
+    if target == "insta":
+        user_modes[user_id] = "insta"
+        await callback.message.answer(
+            format_insta_mode_prompt(),
+            parse_mode=ParseMode.HTML,
+            reply_markup=make_main_reply_keyboard(),
+        )
+        await callback.answer("📸 Режим Instagram NFC включён")
+        return
+
+    if target == "google":
+        user_modes[user_id] = "google"
+        text = (
+            "⭐️ <b>Включён режим: Google Reviews NFC</b>\n\n"
+            "Отправьте название заведения и улицу, ссылку Google Maps или выберите нишу для Автопоиска ТОП-5:"
+        )
+        await callback.message.answer(
+            text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=make_hunt_niche_keyboard(),
+        )
+        await callback.answer("⭐️ Режим Google Reviews NFC")
+        return
+
+    # mode:main — возврат в главное меню
+    user_modes[user_id] = "google"
+    await callback.message.answer(
+        format_main_welcome_text(),
+        parse_mode=ParseMode.HTML,
+        reply_markup=make_start_mode_inline_keyboard(),
+    )
+    await callback.answer("Главное меню")
+
+
+@router.callback_query(F.data.startswith("ig:"))
+async def handle_instagram_callbacks(callback: CallbackQuery):
+    """
+    Обработка кнопок под карточкой Instagram NFC:
+    - ig:ig_pitch:{username} — 🎯 Питч для клиента (Текст)
+    - ig:ig_live:{username}  — 🗣 Скрипт для живого разговора
+    - ig:ig_combo:{username} — 💥 Комбо-оффер (Google + Insta)
+    - ig:r:{action}:{username} — 🔄 Перегенерировать
+    - ig:hide — ⬅️ К карточке Instagram
+    """
+    parts = callback.data.split(":")
+    if len(parts) < 2:
+        await callback.answer()
+        return
+
+    if parts[1] == "hide":
+        try:
+            await callback.message.delete()
+        except Exception:
+            pass
+        await callback.answer("Вернулись к карточке")
+        return
+
+    is_regen = False
+    if parts[1] == "r" and len(parts) >= 4:
+        is_regen = True
+        action = parts[2]
+        clean_username = parts[3]
+    elif len(parts) >= 3:
+        action = parts[1]
+        clean_username = parts[2]
+    else:
+        await callback.answer()
+        return
+
+    await callback.answer("⏳ Генерирую скрипт для Instagram NFC...")
+
+    async with ChatActionSender.typing(bot=callback.bot, chat_id=callback.message.chat.id):
+        try:
+            generated_text = await ai_sales_service.generate_instagram_message(
+                action=action,
+                username=clean_username,
+            )
+            escaped_text = html.escape(generated_text.strip())
+            output_text = f"<code>{escaped_text}</code>"
+            reply_kb = make_instagram_ai_response_keyboard(clean_username, action)
+
+            if is_regen:
+                await callback.message.edit_text(
+                    output_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_kb,
+                )
+            else:
+                await callback.message.reply(
+                    output_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=reply_kb,
+                )
+        except Exception as e:
+            logger.exception("Ошибка генерации текста Instagram NFC: %s", e)
+            await callback.message.answer(
+                f"❌ <b>Ошибка генерации:</b>\n<code>{html.escape(str(e))}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+
+
+async def process_instagram_request(message: Message, raw_text: str):
+    """Обрабатывает ввод аккаунта/ссылки Instagram и отправляет карточку с NFC-ссылками и кнопками ИИ."""
+    try:
+        card_data: InstagramCardData = build_instagram_card_data(raw_text)
+        card_html = format_instagram_card(card_data)
+        kb = make_instagram_card_keyboard(card_data.clean_username)
+        await message.reply(
+            card_html,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+    except InstagramParseError as e:
+        await message.reply(
+            f"⚠️ <b>Ошибка разбора аккаунта Instagram</b>\n\n{e.message}",
+            parse_mode=ParseMode.HTML,
+        )
 
 
 @router.message(Command("hunt"))
@@ -1437,15 +1715,30 @@ async def handle_location(message: Message):
 @router.message(F.text)
 async def handle_text_message(message: Message):
     """
-    Обрабатывает:
-    - Сценарий Б: если в тексте обнаружена ссылка Google Maps.
-    - Сценарий А: текстовый запрос (название + адрес/ориентир).
+    Обрабатывает входящие текстовые запросы с умным автоопределением:
+    - Если сообщение начинается с '@' или содержит 'instagram.com' -> модуль Instagram NFC.
+    - Если обнаружена ссылка Google Maps -> модуль Google Reviews NFC.
+    - Если включён режим '📸 Instagram NFC' -> парсит введённый никнейм Instagram.
+    - Иначе -> текстовый поиск заведения в Google Maps.
     """
     text = message.text.strip()
     if not text:
         return
 
+    user_id = message.from_user.id if message.from_user else 0
+    current_mode = user_modes.get(user_id, "google")
     url_match = MAPS_URL_REGEX.search(text)
+
+    # 1. Автоопределение Instagram: начинается с '@' или содержит 'instagram.com' / 'instagr.am'
+    if is_instagram_input(text):
+        await process_instagram_request(message, text)
+        return
+
+    # 2. Если нет ссылки Google Maps и включён режим Instagram NFC (или введён одиночный ник с '_')
+    is_single_handle_with_underscore = (" " not in text and "_" in text and not url_match)
+    if not url_match and (current_mode == "insta" or is_single_handle_with_underscore):
+        await process_instagram_request(message, text)
+        return
 
     async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
         try:
