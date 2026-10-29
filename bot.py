@@ -400,17 +400,21 @@ def format_contacts_and_crm_block(place: PlaceInfo) -> str:
 def format_nfc_links_block(place: PlaceInfo) -> str:
     """
     Формирует блок из 2 ссылок для NFC Tools:
-    1) ⚡️ Быстрая App-ссылка (maps.google.com/?cid=...) — открывает родное приложение Google Maps за 0.5 сек без браузера!
-    2) ⭐️ Прямая веб-ссылка на окно оценки 5 звёзд (search.google.com/local/writereview?placeid=...)
+    1) ⚡️ Универсальная быстрая ссылка (www.google.com/maps?cid=...) — 0 редиректов!
+       Если есть приложение Google Maps — открывает его за 0.5 сек.
+       Если приложения нет — открывает карточку в браузере напрямую без 2 промежуточных редиректов.
+    2) ⭐️ Прямое окно оценки 5 звёзд (search.google.com/local/writereview?placeid=...)
     """
-    fast_app_url = place.google_maps_url
-    if not fast_app_url or "place_id:" in fast_app_url:
-        fast_app_url = f"https://www.google.com/maps/search/?api=1&query=Google&query_place_id={place.place_id}"
+    fast_app_url = place.google_maps_url or ""
+    if "maps.google.com/?cid=" in fast_app_url:
+        fast_app_url = fast_app_url.replace("https://maps.google.com/?cid=", "https://www.google.com/maps?cid=")
+    if not fast_app_url:
+        fast_app_url = f"https://www.google.com/maps/place/?q=place_id:{place.place_id}"
 
     return (
-        f"⚡️ <b>Быстрая App-ссылка для NFC (0.5 сек — приложение Карт):</b>\n"
+        f"⚡️ <b>Универсальная быстрая ссылка NFC (App + Браузер без редиректов):</b>\n"
         f"<code>{html.escape(fast_app_url)}</code>\n\n"
-        f"⭐️ <b>Прямое окно 5 звёзд (через браузер):</b>\n"
+        f"⭐️ <b>Прямое окно 5 звёзд (только веб-форма):</b>\n"
         f"<code>{html.escape(place.review_url)}</code>"
     )
 

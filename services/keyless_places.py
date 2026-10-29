@@ -127,11 +127,15 @@ class KeylessPlacesService:
                             if (status !== 'OK' || !place) {
                                 return resolve({ pid, phone: null, website: null, url: null });
                             }
+                            let fastUrl = place.url || null;
+                            if (fastUrl && fastUrl.includes('maps.google.com/?cid=')) {
+                                fastUrl = fastUrl.replace('https://maps.google.com/?cid=', 'https://www.google.com/maps?cid=');
+                            }
                             resolve({
                                 pid,
                                 phone: place.international_phone_number || place.formatted_phone_number || null,
                                 website: place.website || null,
-                                url: place.url || null,
+                                url: fastUrl,
                             });
                         }
                     );
