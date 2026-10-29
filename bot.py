@@ -1715,11 +1715,11 @@ async def handle_location(message: Message):
 @router.message(F.text)
 async def handle_text_message(message: Message):
     """
-    Обрабатывает входящие текстовые запросы с умным автоопределением:
-    - Если сообщение начинается с '@' или содержит 'instagram.com' -> модуль Instagram NFC.
-    - Если обнаружена ссылка Google Maps -> модуль Google Reviews NFC.
-    - Если включён режим '📸 Instagram NFC' -> парсит введённый никнейм Instagram.
-    - Иначе -> текстовый поиск заведения в Google Maps.
+    Оба парсера (Google Maps и Instagram NFC) работают ОДНОВРЕМЕННО:
+    - Если обнаружена ссылка Google Maps -> парсер Google Maps.
+    - Если обнаружена ссылка instagram.com, @username, ник с '_' или одиночный латинский ник -> модуль Instagram NFC.
+    - Любой поисковый запрос заведения (с кириллицей или из нескольких слов) -> всегда идёт в парсер Google Maps,
+      даже если до этого нажималась кнопка Instagram NFC!
     """
     text = message.text.strip()
     if not text:
@@ -1729,16 +1729,13 @@ async def handle_text_message(message: Message):
     current_mode = user_modes.get(user_id, "google")
     url_match = MAPS_URL_REGEX.search(text)
 
-    # 1. Автоопределение Instagram: начинается с '@' или содержит 'instagram.com' / 'instagr.am'
-    if is_instagram_input(text):
+    # Если это не ссылка Google Maps и запрос распознан как Instagram-аккаунт / ссылка Instagram
+    if not url_match and is_instagram_input(text, mode_hint=current_mode):
         await process_instagram_request(message, text)
         return
 
-    # 2. Если нет ссылки Google Maps и включён режим Instagram NFC (или введён одиночный ник с '_')
-    is_single_handle_with_underscore = (" " not in text and "_" in text and not url_match)
-    if not url_match and (current_mode == "insta" or is_single_handle_with_underscore):
-        await process_instagram_request(message, text)
-        return
+    # Если пользователь ввёл обычный запрос для Google Карт — автоматически держим режим Google активным
+    user_modes[user_id] = "google"
 
     async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
         try:

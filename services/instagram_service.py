@@ -127,23 +127,41 @@ def parse_instagram_username(raw_input: str) -> str:
     return valid
 
 
-def is_instagram_input(text: str) -> bool:
+def is_instagram_input(text: str, mode_hint: str = "google") -> bool:
     """
-    Автоопределение: возвращает True, если сообщение в любом режиме бота
-    явно является Instagram-профилем:
-    1) Содержит ссылку на instagram.com / instagr.am
-    2) Начинается с символа '@' (например '@phoenix_math_school')
+    Умное одновременное распознавание (оба парсера работают параллельно без блокировки друг друга!):
+    Возвращает True ТОЛЬКО если сообщение является Instagram-профилем:
+    1) Содержит ссылку instagram.com / instagr.am
+    2) Начинается с '@' (например '@phoenix_math_school')
+    3) Одно слово без пробелов и без кириллицы, содержащее '_' или '.' (например 'phoenix_math_school', 'coffee.uz')
+    4) Одно латинское слово без пробелов (например 'safiauz'), если пользователь перед этим нажал '📸 Instagram NFC'.
+    Любой текст с пробелами ('Roni Тараса Шевченко'), кириллицей ('Жигули Бар') или ссылкой Google Maps
+    ВСЕГДА возвращает False и уходит в парсер Google Карт!
     """
     if not text:
         return False
     stripped = text.strip()
     low = stripped.lower()
+
+    # 1. Прямая ссылка на Instagram
     if "instagram.com/" in low or "instagr.am/" in low:
         return True
-    if stripped.startswith("@") and len(stripped) > 1:
-        first_word = stripped.split()[0]
-        if validate_ig_username(first_word) is not None:
+
+    # 2. Никнейм с собачкой @username
+    if stripped.startswith("@") and len(stripped) > 1 and " " not in stripped:
+        return True
+
+    # 3. Если в запросе есть пробелы, кириллица или другая http-ссылка — это 100% поиск заведения в Google Картах!
+    if " " in stripped or low.startswith("http") or re.search(r"[а-яА-ЯёЁ]", stripped):
+        return False
+
+    # 4. Одиночное латинское слово (валидный Instagram handle)
+    if validate_ig_username(stripped) is not None:
+        if "_" in stripped or "." in stripped:
             return True
+        if mode_hint == "insta":
+            return True
+
     return False
 
 
