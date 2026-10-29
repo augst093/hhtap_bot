@@ -665,6 +665,22 @@ def make_contacts_crm_drawer_keyboard(short_id: str) -> InlineKeyboardMarkup:
             )
         rows.append(social_row)
 
+        # Если у точки в Google Maps уже привязан Instagram — даём кнопку 1-клик для генерации Instagram NFC-карты!
+        if cached.website and "instagram.com" in cached.website.lower():
+            try:
+                clean_ig = build_instagram_card_data(cached.website).clean_username
+                if clean_ig and len(clean_ig) <= 30:
+                    rows.append(
+                        [
+                            InlineKeyboardButton(
+                                text=f"📸 Сделать Instagram NFC (@{clean_ig})",
+                                callback_data=f"ig:card:{clean_ig}",
+                            )
+                        ]
+                    )
+            except Exception:
+                pass
+
         # Кнопки статусов Мини-CRM (с галочкой на текущем статусе)
         crm_entry = lead_hunter_service.get_crm_entry(cached.place_id)
         cur_status = crm_entry.get("status") if crm_entry else None
@@ -838,13 +854,14 @@ async def resolve_search_by_url(url: str) -> List[PlaceInfo]:
 async def resolve_search_nearby(
     lat: float, lng: float, radius: int = 200, keyword: Optional[str] = None
 ) -> List[PlaceInfo]:
-    """Поиск по координатам."""
+    """Поиск ближайших заведений по координатам (для живого обхода по геопозиции)."""
     if config.has_google_api_key():
         return await google_places_service.search_nearby(
             lat=lat, lng=lng, radius=radius, keyword=keyword
         )
-    query = keyword if keyword else f"{lat},{lng}"
-    return await keyless_places_service.search_text(query)
+    return await keyless_places_service.search_nearby(
+        lat=lat, lng=lng, radius=radius, keyword=keyword
+    )
 
 
 # ==============================================================================
@@ -1031,6 +1048,23 @@ async def handle_instagram_callbacks(callback: CallbackQuery):
         except Exception:
             pass
         await callback.answer("Вернулись к карточке")
+        return
+
+    if parts[1] == "card" and len(parts) >= 3:
+        clean_username = parts[2]
+        try:
+            card_data: InstagramCardData = build_instagram_card_data(clean_username)
+            card_html = format_instagram_card(card_data)
+            kb = make_instagram_card_keyboard(card_data.clean_username)
+            await callback.message.reply(
+                card_html,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+            await callback.answer(f"📸 NFC-карта для @{clean_username} готова!")
+        except Exception as e:
+            await callback.answer(f"Ошибка: {e}", show_alert=True)
         return
 
     is_regen = False

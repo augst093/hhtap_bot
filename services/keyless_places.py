@@ -66,24 +66,46 @@ class KeylessPlacesService:
         logger.info("Фоновый браузер успешно инициализирован.")
         return self._page
 
-    async def _text_search_via_sdk(self, query: str, max_results: int = 20) -> List[Dict[str, Any]]:
+    async def _text_search_via_sdk(
+        self,
+        query: str,
+        max_results: int = 20,
+        lat: float = 41.3111,
+        lng: float = 69.2797,
+        radius: int = 30000,
+    ) -> List[Dict[str, Any]]:
         """
         Выполняет быстрый запрос через google.maps.places.PlacesService.textSearch
-        прямо внутри страницы, возвращая до 20 заведений с точным рейтингом и числом отзывов.
+        прямо внутри страницы с гео-привязкой к Ташкенту (или переданным координатам),
+        возвращая до 20 заведений с точным рейтингом и числом отзывов.
         """
         page = await self._ensure_page()
         raw_items = await page.evaluate(
-            """(q) => new Promise((resolve) => {
+            """(params) => new Promise((resolve) => {
                 try {
                     if (!window.google || !google.maps || !google.maps.places) {
                         return resolve([]);
                     }
                     const svc = new google.maps.places.PlacesService(document.createElement('div'));
-                    svc.textSearch({ query: q, language: 'ru' }, (results, status) => {
+                    const req = {
+                        query: params.q,
+                        language: 'ru',
+                        location: new google.maps.LatLng(params.lat, params.lng),
+                        radius: params.radius
+                    };
+                    svc.textSearch(req, (results, status) => {
                         if (status !== 'OK' || !results) {
                             return resolve([]);
                         }
-                        const mapped = results.map(r => ({
+                        const skipTypes = new Set(['route', 'street_address', 'locality', 'political', 'neighborhood', 'sublocality', 'postal_code']);
+                        const filtered = results.filter(r => {
+                            const t = Array.isArray(r.types) ? r.types : [];
+                            if (t.length > 0 && t.every(x => skipTypes.has(x))) {
+                                return false;
+                            }
+                            return true;
+                        });
+                        const mapped = filtered.map(r => ({
                             place_id: r.place_id || '',
                             name: r.name || '',
                             address: r.formatted_address || '',
@@ -100,7 +122,87 @@ class KeylessPlacesService:
                     resolve([]);
                 }
             })""",
-            query,
+            {"q": query, "lat": lat, "lng": lng, "radius": radius},
+        )
+        if not raw_items:
+            return []
+        return raw_items[:max_results]
+
+    async def _nearby_search_via_sdk(
+        self,
+        lat: float,
+        lng: float,
+        radius: int = 180,
+        keyword: Optional[str] = None,
+        max_results: int = 8,
+    ) -> List[Dict[str, Any]]:
+        """
+        Ищет ближайшие заведения вокруг гео-точки (для живого полевого обхода по геопозиции).
+        """
+        page = await self._ensure_page()
+        raw_items = await page.evaluate(
+            """(params) => new Promise((resolve) => {
+                try {
+                    if (!window.google || !google.maps || !google.maps.places) {
+                        return resolve([]);
+                    }
+                    const svc = new google.maps.places.PlacesService(document.createElement('div'));
+                    const req = {
+                        location: new google.maps.LatLng(params.lat, params.lng),
+                        radius: params.radius,
+                        language: 'ru'
+                    };
+                    if (params.keyword) {
+                        req.keyword = params.keyword;
+                    }
+                    svc.nearbySearch(req, (results, status) => {
+                        if (status !== 'OK' || !results) {
+                            return resolve([]);
+                        }
+                        const skipTypes = new Set([
+                            'route', 'street_address', 'locality', 'political', 'neighborhood',
+                            'sublocality', 'postal_code', 'transit_station', 'bus_station',
+                            'university', 'primary_school', 'secondary_school', 'local_government_office',
+                            'embassy', 'courthouse', 'police', 'fire_station', 'post_office', 'atm'
+                        ]);
+                        const priorityTypes = new Set([
+                            'restaurant', 'cafe', 'bar', 'bakery', 'meal_takeaway', 'meal_delivery',
+                            'night_club', 'beauty_salon', 'hair_care', 'spa', 'dentist', 'doctor',
+                            'health', 'physiotherapist', 'gym', 'clothing_store', 'SHOE_STORE',
+                            'jewelry_store', 'florist', 'pet_store', 'veterinary_care', 'car_wash', 'car_repair'
+                        ]);
+                        const filtered = results.filter(r => {
+                            const t = Array.isArray(r.types) ? r.types : [];
+                            if (t.some(x => skipTypes.has(x))) {
+                                return false;
+                            }
+                            return (r.business_status || 'OPERATIONAL') === 'OPERATIONAL';
+                        });
+                        filtered.sort((a, b) => {
+                            const ta = Array.isArray(a.types) ? a.types : [];
+                            const tb = Array.isArray(b.types) ? b.types : [];
+                            const pa = ta.some(x => priorityTypes.has(x)) ? 1 : 0;
+                            const pb = tb.some(x => priorityTypes.has(x)) ? 1 : 0;
+                            return pb - pa;
+                        });
+                        const mapped = filtered.map(r => ({
+                            place_id: r.place_id || '',
+                            name: r.name || '',
+                            address: r.vicinity || r.formatted_address || 'Рядом с вами',
+                            rating: typeof r.rating === 'number' ? r.rating : null,
+                            user_ratings_total: typeof r.user_ratings_total === 'number' ? r.user_ratings_total : null,
+                            types: Array.isArray(r.types) ? r.types : [],
+                            business_status: r.business_status || 'OPERATIONAL',
+                            lat: r.geometry && r.geometry.location ? r.geometry.location.lat() : null,
+                            lng: r.geometry && r.geometry.location ? r.geometry.location.lng() : null
+                        }));
+                        resolve(mapped);
+                    });
+                } catch (err) {
+                    resolve([]);
+                }
+            })""",
+            {"lat": lat, "lng": lng, "radius": radius, "keyword": keyword or ""},
         )
         if not raw_items:
             return []
@@ -194,7 +296,14 @@ class KeylessPlacesService:
                 await self.close()
                 return []
 
-    async def search_text(self, query: str, max_results: int = 3) -> List[PlaceInfo]:
+    async def search_text(
+        self,
+        query: str,
+        max_results: int = 3,
+        lat: float = 41.3111,
+        lng: float = 69.2797,
+        radius: int = 30000,
+    ) -> List[PlaceInfo]:
         """
         Ищет заведение по текстовому названию и возвращает список найденных точек
         с Place ID, реальным рейтингом, количеством отзывов, телефоном и сайтом.
@@ -206,7 +315,9 @@ class KeylessPlacesService:
         async with self._lock:
             try:
                 # 1. Сначала пробуем быстрый SDK textSearch (сразу даёт рейтинг и отзывы за 0.3 сек)
-                sdk_items = await self._text_search_via_sdk(clean_query, max_results=max_results)
+                sdk_items = await self._text_search_via_sdk(
+                    clean_query, max_results=max_results, lat=lat, lng=lng, radius=radius
+                )
                 if sdk_items:
                     results: List[PlaceInfo] = []
                     for item in sdk_items:
@@ -319,10 +430,69 @@ class KeylessPlacesService:
                 await self.close()
                 return []
 
+    async def search_nearby(
+        self,
+        lat: float,
+        lng: float,
+        radius: int = 180,
+        keyword: Optional[str] = None,
+        max_results: int = 5,
+    ) -> List[PlaceInfo]:
+        """
+        Автономный поиск ближайших заведений вокруг отправленной геопозиции (в радиусе 180м).
+        Возвращает реальные заведения рядом с пользователем во время пешего рейда.
+        """
+        async with self._lock:
+            try:
+                sdk_items = await self._nearby_search_via_sdk(
+                    lat=lat, lng=lng, radius=radius, keyword=keyword, max_results=max_results
+                )
+                if not sdk_items:
+                    return []
+
+                results: List[PlaceInfo] = []
+                for item in sdk_items:
+                    raw_id = item.get("place_id", "").strip()
+                    if not raw_id:
+                        continue
+                    clean_id = clean_place_id(raw_id)
+                    if not clean_id or any(x.place_id == clean_id for x in results):
+                        continue
+                    results.append(
+                        PlaceInfo(
+                            place_id=clean_id,
+                            name=(item.get("name") or "Заведение рядом").strip(),
+                            address=(item.get("address") or "Рядом с вами").strip(),
+                            rating=item.get("rating"),
+                            user_ratings_total=item.get("user_ratings_total"),
+                            review_url=build_review_url(clean_id),
+                            google_maps_url=f"https://www.google.com/maps/place/?q=place_id:{clean_id}",
+                            latitude=item.get("lat"),
+                            longitude=item.get("lng"),
+                        )
+                    )
+
+                if results:
+                    top_res = results[:max_results]
+                    details_map = await self._fetch_details_via_sdk([p.place_id for p in top_res])
+                    for p in top_res:
+                        info = details_map.get(p.place_id)
+                        if info:
+                            p.phone = info.get("phone")
+                            p.website = info.get("website")
+                            if info.get("url"):
+                                p.google_maps_url = info["url"]
+                    return top_res
+                return []
+            except Exception as e:
+                logger.error("Ошибка при поиске рядом (%s, %s): %s", lat, lng, e)
+                await self.close()
+                return []
+
     async def search_by_url(self, short_url: str) -> List[PlaceInfo]:
         """
         Разворачивает короткую ссылку Google Maps (maps.app.goo.gl)
-        и находит по ней точный Place ID вместе с рейтингом и отзывами.
+        и находит по ней точный Place ID вместе с рейтингом, отзывами и координатами филиала.
         """
         async with httpx.AsyncClient(
             follow_redirects=True,
@@ -340,6 +510,19 @@ class KeylessPlacesService:
 
         logger.info("Развернутая ссылка: %s", final_url)
 
+        # Вытаскиваем точные координаты филиала из развернутой ссылки (если есть)
+        lat_val, lng_val, rad_val = 41.3111, 69.2797, 30000
+        coord_3d4d = re.search(r"!3d(-?\d+\.\d+)!4d(-?\d+\.\d+)", final_url)
+        coord_at = re.search(r"@(-?\d+\.\d+),(-?\d+\.\d+)", final_url)
+        if coord_3d4d:
+            lat_val = float(coord_3d4d.group(1))
+            lng_val = float(coord_3d4d.group(2))
+            rad_val = 1500
+        elif coord_at:
+            lat_val = float(coord_at.group(1))
+            lng_val = float(coord_at.group(2))
+            rad_val = 2000
+
         name_match = re.search(r"/maps/place/([^/@?]+)", final_url)
         place_name = None
         if name_match:
@@ -353,13 +536,15 @@ class KeylessPlacesService:
                 place_name = qs["q"][0].strip()
 
         if not place_name:
+            if rad_val <= 2000:
+                return await self.search_nearby(lat=lat_val, lng=lng_val, radius=120)
             raise LinkExpansionError(
                 "Не удалось извлечь название заведения из ссылки. "
                 "Попробуйте отправить текстовое название заведения."
             )
 
-        logger.info("Найдено название заведения из ссылки: '%s'", place_name)
-        return await self.search_text(place_name)
+        logger.info("Найдено название заведения из ссылки: '%s' (coords: %s, %s)", place_name, lat_val, lng_val)
+        return await self.search_text(place_name, lat=lat_val, lng=lng_val, radius=rad_val)
 
     async def close(self):
         """Освобождает ресурсы браузера при остановке бота."""
