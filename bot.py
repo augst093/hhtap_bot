@@ -397,6 +397,24 @@ def format_contacts_and_crm_block(place: PlaceInfo) -> str:
     return "\n" + "\n".join(lines) + "\n"
 
 
+def format_nfc_links_block(place: PlaceInfo) -> str:
+    """
+    Формирует блок из 2 ссылок для NFC Tools:
+    1) ⚡️ Быстрая App-ссылка (maps.google.com/?cid=...) — открывает родное приложение Google Maps за 0.5 сек без браузера!
+    2) ⭐️ Прямая веб-ссылка на окно оценки 5 звёзд (search.google.com/local/writereview?placeid=...)
+    """
+    fast_app_url = place.google_maps_url
+    if not fast_app_url or "place_id:" in fast_app_url:
+        fast_app_url = f"https://www.google.com/maps/search/?api=1&query=Google&query_place_id={place.place_id}"
+
+    return (
+        f"⚡️ <b>Быстрая App-ссылка для NFC (0.5 сек — приложение Карт):</b>\n"
+        f"<code>{html.escape(fast_app_url)}</code>\n\n"
+        f"⭐️ <b>Прямое окно 5 звёзд (через браузер):</b>\n"
+        f"<code>{html.escape(place.review_url)}</code>"
+    )
+
+
 def format_place_card(place: PlaceInfo) -> str:
     """Форматирует стандартную карточку заведения (для ручного поиска) с контактами и CRM."""
     rating_part = ""
@@ -408,13 +426,13 @@ def format_place_card(place: PlaceInfo) -> str:
         rating_part = "⭐️ Точка найдена"
 
     contacts_block = format_contacts_and_crm_block(place)
+    links_block = format_nfc_links_block(place)
 
     card = (
         f"🏢 <b>{html.escape(place.name)}</b> ({rating_part})\n"
         f"📍 <i>{html.escape(place.address)}</i>\n"
         f"{contacts_block}\n"
-        f"🔗 <b>Ссылка для NFC Tools (тапни для копирования):</b>\n"
-        f"<code>{place.review_url}</code>"
+        f"{links_block}"
     )
     return card
 
@@ -452,6 +470,7 @@ def format_carousel_slide(batch: HuntCarouselBatch, idx: int) -> str:
         rating_part = "⭐️ Мало оценок"
 
     contacts_block = format_contacts_and_crm_block(place)
+    links_block = format_nfc_links_block(place)
 
     return (
         f"{header_line}\n"
@@ -462,8 +481,7 @@ def format_carousel_slide(batch: HuntCarouselBatch, idx: int) -> str:
         f"📍 <i>{html.escape(place.address)}</i>\n"
         f"{contacts_block}\n"
         f"💡 <b>Почему купят:</b>\n{html.escape(lead.why_hot)}\n\n"
-        f"🔗 <b>Ссылка для NFC Tools (тапни для копирования):</b>\n"
-        f"<code>{place.review_url}</code>"
+        f"{links_block}"
     )
 
 

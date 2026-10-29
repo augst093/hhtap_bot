@@ -122,20 +122,21 @@ class KeylessPlacesService:
                     }
                     const svc = new google.maps.places.PlacesService(document.createElement('div'));
                     svc.getDetails(
-                        { placeId: pid, fields: ['formatted_phone_number', 'international_phone_number', 'website'] },
+                        { placeId: pid, fields: ['formatted_phone_number', 'international_phone_number', 'website', 'url'] },
                         (place, status) => {
                             if (status !== 'OK' || !place) {
-                                return resolve({ pid, phone: null, website: null });
+                                return resolve({ pid, phone: null, website: null, url: null });
                             }
                             resolve({
                                 pid,
                                 phone: place.international_phone_number || place.formatted_phone_number || null,
                                 website: place.website || null,
+                                url: place.url || null,
                             });
                         }
                     );
                 } catch (e) {
-                    resolve({ pid, phone: null, website: null });
+                    resolve({ pid, phone: null, website: null, url: null });
                 }
             })))""",
             place_ids,
@@ -148,11 +149,12 @@ class KeylessPlacesService:
                     out[pid] = {
                         "phone": d.get("phone"),
                         "website": d.get("website"),
+                        "url": d.get("url"),
                     }
         return out
 
     async def enrich_places_contacts(self, places: List[PlaceInfo]) -> None:
-        """Обогащает список объектов PlaceInfo номерами телефонов и сайтами/Инстаграмами."""
+        """Обогащает список объектов PlaceInfo номерами телефонов, сайтами/Инстаграмами и быстрой CID-ссылкой."""
         pids = [p.place_id for p in places if p.place_id and not p.phone]
         if not pids:
             return
@@ -166,6 +168,8 @@ class KeylessPlacesService:
                             p.phone = info["phone"]
                         if info.get("website"):
                             p.website = info["website"]
+                        if info.get("url"):
+                            p.google_maps_url = info["url"]
             except Exception as e:
                 logger.warning("Не удалось обогатить контакты для точек: %s", e)
 
@@ -229,6 +233,8 @@ class KeylessPlacesService:
                             if info:
                                 p.phone = info.get("phone")
                                 p.website = info.get("website")
+                                if info.get("url"):
+                                    p.google_maps_url = info["url"]
                         return top_res
 
                 # 2. Fallback на Autocomplete (#pac-input), если textSearch ничего не вернул
