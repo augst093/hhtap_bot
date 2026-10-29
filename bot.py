@@ -31,6 +31,7 @@ from services.google_places import (
     QuotaExceededError,
     RequestDeniedError,
     ZeroResultsError,
+    build_fast_reviews_app_url,
     google_places_service,
 )
 from services.keyless_places import keyless_places_service
@@ -400,21 +401,19 @@ def format_contacts_and_crm_block(place: PlaceInfo) -> str:
 def format_nfc_links_block(place: PlaceInfo) -> str:
     """
     Формирует блок из 2 ссылок для NFC Tools:
-    1) ⚡️ Универсальная быстрая ссылка (www.google.com/maps?cid=...) — 0 редиректов!
-       Если есть приложение Google Maps — открывает его за 0.5 сек.
-       Если приложения нет — открывает карточку в браузере напрямую без 2 промежуточных редиректов.
-    2) ⭐️ Прямое окно оценки 5 звёзд (search.google.com/local/writereview?placeid=...)
+    1) ⚡️ Быстрая ссылка сразу на ОТЗЫВЫ (App + Браузер, 0 редиректов):
+       https://www.google.com/maps/place//data=!4m4!3m3!1s0x...:0x...!9m1!1b1
+       Флаг !9m1!1b1 — официальный параметр Google (reviewsUri / writeAReviewUri), который:
+       - при наличии приложения Google Maps открывает его за 0.5 сек СРАЗУ на вкладке «Отзывы»;
+       - без приложения открывает вкладку «Отзывы» в браузере с 0 редиректов!
+    2) ⭐️ Веб-форма 5 звёзд (search.google.com/local/writereview?placeid=...)
     """
-    fast_app_url = place.google_maps_url or ""
-    if "maps.google.com/?cid=" in fast_app_url:
-        fast_app_url = fast_app_url.replace("https://maps.google.com/?cid=", "https://www.google.com/maps?cid=")
-    if not fast_app_url:
-        fast_app_url = f"https://www.google.com/maps/place/?q=place_id:{place.place_id}"
+    fast_reviews_url = build_fast_reviews_app_url(place.place_id, place.google_maps_url)
 
     return (
-        f"⚡️ <b>Универсальная быстрая ссылка NFC (App + Браузер без редиректов):</b>\n"
-        f"<code>{html.escape(fast_app_url)}</code>\n\n"
-        f"⭐️ <b>Прямое окно 5 звёзд (только веб-форма):</b>\n"
+        f"⚡️ <b>Быстрая ссылка NFC СРАЗУ НА ОТЗЫВЫ (App + Браузер):</b>\n"
+        f"<code>{html.escape(fast_reviews_url)}</code>\n\n"
+        f"⭐️ <b>Веб-окно 5 звёзд (альтернатива для браузера):</b>\n"
         f"<code>{html.escape(place.review_url)}</code>"
     )
 
@@ -561,7 +560,7 @@ def make_carousel_keyboard(batch: HuntCarouselBatch, idx: int) -> InlineKeyboard
                 ),
                 InlineKeyboardButton(
                     text="🔗 5⭐️",
-                    url=lead.place.review_url,
+                    url=build_fast_reviews_app_url(lead.place.place_id, lead.place.google_maps_url),
                 ),
             ],
             nav_row,
@@ -614,7 +613,7 @@ def make_place_keyboard(place: PlaceInfo) -> InlineKeyboardMarkup:
                 ),
                 InlineKeyboardButton(
                     text="🔗 5⭐️",
-                    url=place.review_url,
+                    url=build_fast_reviews_app_url(place.place_id, place.google_maps_url),
                 ),
             ],
         ]

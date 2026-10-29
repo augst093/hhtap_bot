@@ -1,4 +1,6 @@
+import base64
 import re
+import struct
 import urllib.parse
 import logging
 from dataclasses import dataclass
@@ -75,6 +77,43 @@ def build_review_url(place_id: str) -> str:
         raise ValueError("Невозможно создать ссылку для пустого place_id")
     url = f"https://search.google.com/local/writereview?placeid={clean_id}".strip()
     return url
+
+
+def build_fast_reviews_app_url(place_id: str, cid_url: Optional[str] = None) -> str:
+    """
+    Генерирует официальную быструю универсальную ссылку Google Maps (writeAReviewUri / reviewsUri):
+    https://www.google.com/maps/place//data=!4m4!3m3!1s0x...:0x...!9m1!1b1
+
+    Как она работает:
+    - На телефонах с установленным приложением Google Maps (iOS / Android):
+      перехватывается как Universal Link / App Link за 0.5 сек и за счёт флага !9m1!1b1
+      открывает СРАЗУ вкладку «Отзывы» (Reviews) внутри приложения (без браузера!).
+    - На устройствах без приложения Google Maps (мобильный Safari / Chrome / ПК):
+      открывает карточку на вкладке «Отзывы» напрямую с 0 редиректов (hops=0).
+    """
+    clean_id = clean_place_id(place_id)
+    # 1. Декодируем 20-байтный Protobuf из стандартного ChIJ... place_id (s2_cell_id + cid)
+    if clean_id.startswith("ChIJ"):
+        try:
+            padded = clean_id + "=" * ((4 - len(clean_id) % 4) % 4)
+            raw = base64.urlsafe_b64decode(padded)
+            if len(raw) >= 20 and raw[0] == 0x0A and raw[2] == 0x09 and raw[11] == 0x11:
+                cell_id, cid_int = struct.unpack("<Q", raw[3:11])[0], struct.unpack("<Q", raw[12:20])[0]
+                return f"https://www.google.com/maps/place//data=!4m4!3m3!1s0x{cell_id:x}:0x{cid_int:x}!9m1!1b1"
+        except Exception:
+            pass
+
+    # 2. Резервный расчёт через цифровой cid, если он есть в cid_url
+    if cid_url:
+        m = re.search(r"cid=(\d+)", cid_url)
+        if m:
+            try:
+                cid_int = int(m.group(1))
+                return f"https://www.google.com/maps/place//data=!4m4!3m3!1s0x0:0x{cid_int:x}!9m1!1b1"
+            except Exception:
+                pass
+
+    return build_review_url(clean_id)
 
 
 @dataclass
