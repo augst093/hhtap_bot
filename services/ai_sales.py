@@ -11,6 +11,7 @@ import logging
 import math
 import random
 import re
+import time
 from typing import Optional, Dict, Any, List
 
 import httpx
@@ -421,6 +422,14 @@ class AISalesService:
 
     def __init__(self) -> None:
         self._decks: Dict[str, List[Any]] = {}
+        self._http_client: Optional[httpx.AsyncClient] = None
+        self._consecutive_failures: int = 0
+        self._circuit_open_until: float = 0.0
+
+    def _get_http_client(self) -> httpx.AsyncClient:
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(timeout=httpx.Timeout(6.0, connect=3.0))
+        return self._http_client
 
     def _pick_from_deck(self, key: str, items: List[Any]) -> Any:
         deck = self._decks.get(key)
@@ -782,11 +791,15 @@ class AISalesService:
         max_tokens: int = MAX_TOKENS,
     ) -> Optional[str]:
         """
-        Пытается получить ответ от Anymodel.org с коротким таймаутом (12 сек).
-        Если сервер Anymodel лежит или перегружен — возвращает None для мгновенного фоллбэка.
+        Пытается получить ответ от Anymodel.org с быстрым таймаутом (6 сек) и защитным Circuit Breaker.
+        Если сервер Anymodel лежит или перегружен — мгновенно включает встроенный генератор без лагов.
         """
         api_key = config.anymodel_api_key.strip()
         if not api_key or api_key == "your_anymodel_api_key_here":
+            return None
+
+        now = time.monotonic()
+        if now < self._circuit_open_until:
             return None
 
         endpoint = f"{config.anymodel_base_url.rstrip('/')}/chat/completions"
@@ -813,19 +826,27 @@ class AISalesService:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=6.0)) as client:
-                response = await client.post(endpoint, headers=headers, json=payload)
+            client = self._get_http_client()
+            response = await client.post(endpoint, headers=headers, json=payload)
             if response.status_code == 200:
+                self._consecutive_failures = 0
                 content = response.json()["choices"][0]["message"]["content"]
                 if content and len(content.strip()) > 30:
                     return content
+
+            self._consecutive_failures += 1
+            if response.status_code in (401, 402, 403, 404) or self._consecutive_failures >= 2:
+                self._circuit_open_until = time.monotonic() + 600.0
             logger.warning(
                 "Anymodel API вернул статус %s, переключаемся на мгновенный встроенный генератор HHtap.",
                 response.status_code,
             )
         except Exception as e:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= 2:
+                self._circuit_open_until = time.monotonic() + 600.0
             logger.warning(
-                "Anymodel API не ответил за 12 сек (%s), используем мгновенный встроенный генератор HHtap.",
+                "Anymodel API не ответил за 6 сек (%s), используем мгновенный встроенный генератор HHtap.",
                 e,
             )
 

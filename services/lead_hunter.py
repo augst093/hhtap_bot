@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -769,8 +770,13 @@ class LeadHunterService:
             if not queries:
                 break
 
-            for q in queries:
-                raw_items = await self._fetch_raw_query(q)
+            batches = await asyncio.gather(
+                *[self._fetch_raw_query(q) for q in queries],
+                return_exceptions=True,
+            )
+            for raw_items in batches:
+                if not isinstance(raw_items, list):
+                    continue
                 total_scanned += len(raw_items)
 
                 for item in raw_items:

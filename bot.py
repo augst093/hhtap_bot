@@ -32,6 +32,7 @@ from services.google_places import (
     RequestDeniedError,
     ZeroResultsError,
     build_fast_reviews_app_url,
+    build_review_url,
     google_places_service,
 )
 from services.keyless_places import keyless_places_service
@@ -102,6 +103,7 @@ class CachedPlace:
     rating: Optional[float]
     reviews_count: Optional[int]
     review_link: str
+    google_maps_url: Optional[str] = None
     phone: Optional[str] = None
     website: Optional[str] = None
     score: int = 85
@@ -136,13 +138,15 @@ def cache_place(
     raw = f"{place.place_id}:{place.name}"
     short_id = hashlib.md5(raw.encode("utf-8")).hexdigest()[:8]
     existing = place_cache.get(short_id)
+    direct_review_url = place.review_url or (existing.review_link if existing else "") or build_review_url(place.place_id)
     place_cache[short_id] = CachedPlace(
         place_id=place.place_id,
         name=place.name,
         address=place.address,
         rating=place.rating,
         reviews_count=place.user_ratings_total,
-        review_link=place.review_url,
+        review_link=direct_review_url,
+        google_maps_url=place.google_maps_url or (existing.google_maps_url if existing else None),
         phone=place.phone or (existing.phone if existing else None),
         website=place.website or (existing.website if existing else None),
         score=score or (existing.score if existing else 85),
@@ -400,21 +404,20 @@ def format_contacts_and_crm_block(place: PlaceInfo) -> str:
 
 def format_nfc_links_block(place: PlaceInfo) -> str:
     """
-    Формирует блок из 2 ссылок для NFC Tools:
-    1) ⚡️ Быстрая ссылка сразу на ОТЗЫВЫ (App + Браузер, 0 редиректов):
+    Формирует блок из ОБЕИХ рабочих ссылок для NFC Tools (обе всегда присутствуют в карточке):
+    1) ⚡️ Ссылка №1 — Быстрые отзывы в приложении Google Maps (0.5 сек, флаг !9m1!1b1):
        https://www.google.com/maps/place//data=!4m4!3m3!1s0x...:0x...!9m1!1b1
-       Флаг !9m1!1b1 — официальный параметр Google (reviewsUri / writeAReviewUri), который:
-       - при наличии приложения Google Maps открывает его за 0.5 сек СРАЗУ на вкладке «Отзывы»;
-       - без приложения открывает вкладку «Отзывы» в браузере с 0 редиректов!
-    2) ⭐️ Веб-форма 5 звёзд (search.google.com/local/writereview?placeid=...)
+    2) ⭐️ Ссылка №2 — Прямое окно оценки 5 звёзд (Универсальная: работает везде, с приложением и без):
+       https://search.google.com/local/writereview?placeid=ChIJ...
     """
     fast_reviews_url = build_fast_reviews_app_url(place.place_id, place.google_maps_url)
+    direct_5star_url = place.review_url or build_review_url(place.place_id)
 
     return (
-        f"⚡️ <b>Быстрая ссылка NFC СРАЗУ НА ОТЗЫВЫ (App + Браузер):</b>\n"
+        f"⚡️ <b>Ссылка №1 — Быстрые отзывы (Google Maps App):</b>\n"
         f"<code>{html.escape(fast_reviews_url)}</code>\n\n"
-        f"⭐️ <b>Веб-окно 5 звёзд (альтернатива для браузера):</b>\n"
-        f"<code>{html.escape(place.review_url)}</code>"
+        f"⭐️ <b>Ссылка №2 — Прямое окно 5 звёзд (Универсальная • Любое устройство):</b>\n"
+        f"<code>{html.escape(direct_5star_url)}</code>"
     )
 
 
@@ -560,7 +563,7 @@ def make_carousel_keyboard(batch: HuntCarouselBatch, idx: int) -> InlineKeyboard
                 ),
                 InlineKeyboardButton(
                     text="🔗 5⭐️",
-                    url=build_fast_reviews_app_url(lead.place.place_id, lead.place.google_maps_url),
+                    url=lead.place.review_url or build_review_url(lead.place.place_id),
                 ),
             ],
             nav_row,
@@ -613,7 +616,7 @@ def make_place_keyboard(place: PlaceInfo) -> InlineKeyboardMarkup:
                 ),
                 InlineKeyboardButton(
                     text="🔗 5⭐️",
-                    url=build_fast_reviews_app_url(place.place_id, place.google_maps_url),
+                    url=place.review_url or build_review_url(place.place_id),
                 ),
             ],
         ]
@@ -1289,7 +1292,8 @@ async def handle_crm_callbacks(callback: CallbackQuery):
             address=cached.address,
             rating=cached.rating,
             user_ratings_total=cached.reviews_count,
-            review_url=cached.review_link,
+            review_url=cached.review_link or build_review_url(cached.place_id),
+            google_maps_url=cached.google_maps_url,
             phone=cached.phone,
             website=cached.website,
         )
@@ -1329,7 +1333,8 @@ async def handle_crm_callbacks(callback: CallbackQuery):
             address=cached.address,
             rating=cached.rating,
             user_ratings_total=cached.reviews_count,
-            review_url=cached.review_link,
+            review_url=cached.review_link or build_review_url(cached.place_id),
+            google_maps_url=cached.google_maps_url,
             phone=cached.phone,
             website=cached.website,
         )
@@ -1643,7 +1648,8 @@ async def handle_ai_callbacks(callback: CallbackQuery):
                     address=cached.address,
                     rating=cached.rating,
                     user_ratings_total=cached.reviews_count,
-                    review_url=cached.review_link,
+                    review_url=cached.review_link or build_review_url(cached.place_id),
+                    google_maps_url=cached.google_maps_url,
                     phone=cached.phone,
                     website=cached.website,
                 )
