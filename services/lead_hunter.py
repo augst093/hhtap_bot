@@ -497,9 +497,11 @@ def evaluate_lead_potential(item: Dict[str, Any]) -> Optional[ScoredLead]:
         rating=rating,
         user_ratings_total=reviews,
         review_url=build_review_url(clean_id),
-        google_maps_url=f"https://www.google.com/maps/place/?q=place_id:{clean_id}",
+        google_maps_url=item.get("url") or f"https://www.google.com/maps/place/?q=place_id:{clean_id}",
         latitude=item.get("lat"),
         longitude=item.get("lng"),
+        phone=item.get("phone"),
+        website=item.get("website"),
     )
 
     return ScoredLead(

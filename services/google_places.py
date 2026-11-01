@@ -79,6 +79,23 @@ def build_review_url(place_id: str) -> str:
     return url
 
 
+def encode_hex_to_place_id(hex_id: str) -> Optional[str]:
+    """
+    Кодирует пару 0x{s2_cell_id}:0x{cid} обратно в стандартный 27-символьный ChIJ... place_id
+    через 20-байтный Protobuf Google Maps.
+    """
+    m = re.match(r"^0x([0-9a-fA-F]+):0x([0-9a-fA-F]+)$", (hex_id or "").strip())
+    if not m:
+        return None
+    try:
+        cell_id = int(m.group(1), 16)
+        cid_int = int(m.group(2), 16)
+        raw = b"\x0a\x12\x09" + struct.pack("<Q", cell_id) + b"\x11" + struct.pack("<Q", cid_int)
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    except Exception:
+        return None
+
+
 def build_fast_reviews_app_url(place_id: str, cid_url: Optional[str] = None) -> str:
     """
     Генерирует официальную быструю универсальную ссылку Google Maps (writeAReviewUri / reviewsUri):
@@ -103,8 +120,11 @@ def build_fast_reviews_app_url(place_id: str, cid_url: Optional[str] = None) -> 
         except Exception:
             pass
 
-    # 2. Резервный расчёт через цифровой cid, если он есть в cid_url
+    # 2. Резервный расчёт через hex_id или цифровой cid, если он есть в cid_url
     if cid_url:
+        m_hex = re.search(r"(0x[0-9a-fA-F]+:0x[0-9a-fA-F]+)", cid_url)
+        if m_hex and not m_hex.group(1).startswith("0x0:"):
+            return f"https://www.google.com/maps/place//data=!4m4!3m3!1s{m_hex.group(1).lower()}!9m1!1b1"
         m = re.search(r"cid=(\d+)", cid_url)
         if m:
             try:
