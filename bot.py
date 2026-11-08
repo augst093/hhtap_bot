@@ -110,6 +110,8 @@ user_last_hc_location: Dict[int, str] = {}
 hc_pack_cache: Dict[str, HighChanceLocationPack] = {}
 # Кэш уже отсканированных списков мест по названию локации: location_lower -> List[PlaceInfo]
 hc_places_cache: Dict[str, List[PlaceInfo]] = {}
+# Кэш уже верифицированных Instagram-лидов по локации: location_lower -> List[HighChanceInstaLead]
+hc_insta_leads_cache: Dict[str, List[HighChanceInstaLead]] = {}
 
 
 # ==============================================================================
@@ -1224,8 +1226,9 @@ def format_hc_pack_page(
         u_esc = html.escape(lead.ig_username)
         web_url = f"https://www.instagram.com/{u_esc}/"
         flw_str = f"{lead.followers:,}".replace(",", " ") + " подп."
+        posts_str = f" ({lead.posts} публ.)" if getattr(lead, "posts", 0) else ""
         lines.append(
-            f"\n<b>{idx}. {short_name}</b>  •  🔥 <b>{flw_str}</b>\n"
+            f"\n<b>{idx}. {short_name}</b>  •  🔥 <b>{flw_str}</b>{posts_str}\n"
             f"👤 <b>@{u_esc}</b> — <a href=\"{web_url}\">Перейти на аккаунт ↗️</a>\n"
             f"📍 {addr_short}{phone_str}\n"
             f"🏷 NFC: <code>{html.escape(lead.primary_nfc_url)}</code>"
@@ -1293,7 +1296,7 @@ def make_hc_pack_keyboard(
     if item_btns:
         rows.append(item_btns)
 
-    # Ряд 3: Переключение режима на этой же улице + выбор другой улицы
+    # Ряд 3: Переключение режима на этой же улице + выбор другой улицы + обновление
     other_mode = "insta" if mode == "google" else "google"
     other_btn_text = "📸 Режим: Instagram" if other_mode == "insta" else "⭐️ Режим: Google Карты"
     rows.append(
@@ -1306,6 +1309,10 @@ def make_hc_pack_keyboard(
                 text="📍 Другая улица",
                 callback_data=f"hc:mode:{mode}",
             ),
+            InlineKeyboardButton(
+                text="🔄",
+                callback_data=f"hc:refresh:{pack.pack_id}:{mode}",
+            ),
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1317,6 +1324,7 @@ async def execute_high_chance_scan(
     mode: str,
     user_id: int = 0,
     edit_existing: bool = False,
+    force_refresh: bool = False,
 ):
     """
     Автономно собирает ВСЕ бизнесы на заданной локации, ранжирует их по выбранному критерию
@@ -1328,14 +1336,13 @@ async def execute_high_chance_scan(
         user_hc_pending_mode.pop(user_id, None)
 
     mode_label = (
-        "⭐️ Google Reviews (плохие отзывы и мало оценок)"
+        "⭐️ Google Карты (плохие отзывы и мало оценок)"
         if mode == "google"
         else "📸 Instagram (мало подписчиков и слабый поток)"
     )
     status_text = (
-        f"🛰 <b>Сканирую всю локацию «{html.escape(loc_clean)}»...</b>\n"
-        f"🧭 Режим: <b>{mode_label}</b>\n"
-        "<i>Собираю все заведения улицы, проверяю показатели и отбираю 5 ЛУЧШИХ...</i>"
+        f"🛰 <b>Шаг 1/2: Собираю все бизнесы на улице «{html.escape(loc_clean)}»...</b>\n"
+        f"🧭 Режим: <b>{mode_label}</b>"
     )
 
     if edit_existing:
@@ -1350,7 +1357,7 @@ async def execute_high_chance_scan(
     async with ChatActionSender.typing(bot=target_message.bot, chat_id=target_message.chat.id):
         try:
             loc_key = loc_clean.lower()
-            if loc_key in hc_places_cache and hc_places_cache[loc_key]:
+            if not force_refresh and loc_key in hc_places_cache and hc_places_cache[loc_key]:
                 places = hc_places_cache[loc_key]
             else:
                 places = await collect_all_location_places(loc_clean)
@@ -1372,7 +1379,25 @@ async def execute_high_chance_scan(
             google_leads = rank_google_reviews_leads(places)
             insta_leads: List[HighChanceInstaLead] = []
             if mode == "insta":
-                insta_leads = await rank_instagram_low_followers_leads(places)
+                if not force_refresh and loc_key in hc_insta_leads_cache and hc_insta_leads_cache[loc_key]:
+                    insta_leads = hc_insta_leads_cache[loc_key]
+                else:
+                    try:
+                        await status_msg.edit_text(
+                            f"🔎 <b>Шаг 2/2: Нашёл {len(places)} заведений на «{html.escape(loc_clean)}»!</b>\n"
+                            "<i>Проверяю подлинность их Instagram-аккаунтов (телефоны, биографии, Ташкент) и считаю подписчиков...</i>",
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        pass
+                    insta_leads = await rank_instagram_low_followers_leads(places)
+                    if insta_leads:
+                        hc_insta_leads_cache[loc_key] = insta_leads
+                        if len(hc_insta_leads_cache) > 100:
+                            oldest_ig_k = next(iter(hc_insta_leads_cache))
+                            del hc_insta_leads_cache[oldest_ig_k]
+            elif loc_key in hc_insta_leads_cache:
+                insta_leads = hc_insta_leads_cache[loc_key]
 
             pack_id = uuid.uuid4().hex[:8]
             pack = HighChanceLocationPack(
@@ -1546,6 +1571,24 @@ async def handle_high_chance_callbacks(callback: CallbackQuery):
         await callback.answer(f"📦 Пачка #{page_idx + 1}")
         return
 
+    if action == "refresh" and len(parts) >= 4:
+        pack_id = parts[2]
+        mode = parts[3]
+        pack = hc_pack_cache.get(pack_id)
+        if not pack:
+            await callback.answer("⚠️ Сессия устарела. Запустите парсер локации заново.", show_alert=True)
+            return
+        await callback.answer(f"🔄 Обновляю «{pack.location_query}»...")
+        await execute_high_chance_scan(
+            callback.message,
+            location_query=pack.location_query,
+            mode=mode,
+            user_id=user_id,
+            edit_existing=True,
+            force_refresh=True,
+        )
+        return
+
     if action == "switch" and len(parts) >= 4:
         pack_id = parts[2]
         target_mode = parts[3]
@@ -1553,19 +1596,24 @@ async def handle_high_chance_callbacks(callback: CallbackQuery):
         if not pack:
             await callback.answer("⚠️ Сессия устарела. Запустите парсер локации заново.", show_alert=True)
             return
+        loc_key = pack.location_query.lower()
         if target_mode == "insta" and not pack.insta_leads:
-            await callback.answer("📸 Проверяю подписчиков Instagram по всем точкам улицы...")
-            try:
-                await callback.message.edit_text(
-                    f"📸 <b>Проверяю Instagram-аккаунты и подписчиков на «{html.escape(pack.location_query)}»...</b>\n"
-                    "<i>Отбираю бизнесы с самым малым числом подписчиков и слабым потоком...</i>",
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                pass
-            loc_key = pack.location_query.lower()
-            places = hc_places_cache.get(loc_key) or await collect_all_location_places(pack.location_query)
-            pack.insta_leads = await rank_instagram_low_followers_leads(places)
+            if loc_key in hc_insta_leads_cache and hc_insta_leads_cache[loc_key]:
+                pack.insta_leads = hc_insta_leads_cache[loc_key]
+            else:
+                await callback.answer("📸 Проверяю подписчиков Instagram по всем точкам улицы...")
+                try:
+                    await callback.message.edit_text(
+                        f"📸 <b>Проверяю Instagram-аккаунты и подписчиков на «{html.escape(pack.location_query)}»...</b>\n"
+                        "<i>Отбираю 100% реальные бизнесы Ташкента с малым числом подписчиков...</i>",
+                        parse_mode=ParseMode.HTML,
+                    )
+                except Exception:
+                    pass
+                places = hc_places_cache.get(loc_key) or await collect_all_location_places(pack.location_query)
+                pack.insta_leads = await rank_instagram_low_followers_leads(places)
+                if pack.insta_leads:
+                    hc_insta_leads_cache[loc_key] = pack.insta_leads
         pack.mode = target_mode
         page_text = format_hc_pack_page(pack, mode=target_mode, page_idx=0)
         page_kb = make_hc_pack_keyboard(pack, mode=target_mode, page_idx=0)

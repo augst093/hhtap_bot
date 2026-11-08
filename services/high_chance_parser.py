@@ -1,7 +1,9 @@
 import asyncio
 import html
 import logging
+import math
 import re
+import statistics
 import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -164,10 +166,21 @@ def _normalize_brand_key(name: str) -> str:
     return cleaned[:16] if cleaned else low
 
 
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    r = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2) ** 2
+    )
+    return 2 * r * math.asin(math.sqrt(a))
+
+
 async def collect_all_location_places(location_query: str) -> List[PlaceInfo]:
     """
-    Параллельно сканирует заданную локацию по 8 коммерческим категориям через быстрый HTTP-движок Google Maps.
-    Собирает 50–75 уникальных заведений за ~1.5 секунды и убирает дубли.
+    Параллельно сканирует заданную локацию по 8 коммерческим категориям + прицельному GPS-квадрату улицы,
+    вычисляет точный гео-центр улицы и отсекает случайные выбросы из других районов города (> 2.2 км).
     """
     loc = location_query.strip()
     if "ташкент" not in loc.lower() and "tashkent" not in loc.lower():
@@ -186,10 +199,10 @@ async def collect_all_location_places(location_query: str) -> List[PlaceInfo]:
         f"цветы букеты подарки магазин {loc_with_city}",
     ]
 
-    async def _fetch_cat(q: str) -> List[PlaceInfo]:
+    async def _fetch_cat(q: str, lat: float = 41.3111, lng: float = 69.2797, radius: int = 30000) -> List[PlaceInfo]:
         try:
             return await asyncio.wait_for(
-                keyless_places_service.search_text(q, max_results=14),
+                keyless_places_service.search_text(q, max_results=14, lat=lat, lng=lng, radius=radius),
                 timeout=4.5,
             )
         except Exception as e:
@@ -197,30 +210,76 @@ async def collect_all_location_places(location_query: str) -> List[PlaceInfo]:
             return []
 
     batches = await asyncio.gather(*[_fetch_cat(q) for q in queries])
+    raw_places: List[PlaceInfo] = [p for b in batches for p in b if p.place_id]
+
+    # Вычисляем точный GPS-центр выбранной улицы по точкам, чей адрес содержит название улицы
+    loc_words = [
+        w for w in re.findall(r"[a-zа-яё0-9]{3,}", loc.lower())
+        if w not in ("ташкент", "tashkent", "улица", "район", "квартал", "массив", "проспект")
+    ]
+    loc_lat_words = [_cyr_to_latin(w) for w in loc_words]
+    all_loc_tokens = set(loc_words + loc_lat_words)
+
+    anchored_coords: List[Tuple[float, float]] = []
+    all_coords: List[Tuple[float, float]] = []
+    for p in raw_places:
+        if p.latitude and p.longitude:
+            all_coords.append((p.latitude, p.longitude))
+            addr_low = f"{p.address or ''} {p.name or ''}".lower()
+            addr_lat = _cyr_to_latin(addr_low)
+            if any(tok[:5] in addr_low or tok[:5] in addr_lat for tok in all_loc_tokens if len(tok) >= 3):
+                anchored_coords.append((p.latitude, p.longitude))
+
+    ref_coords = anchored_coords if len(anchored_coords) >= 2 else all_coords
+    med_lat: Optional[float] = None
+    med_lng: Optional[float] = None
+    if ref_coords:
+        med_lat = statistics.median([c[0] for c in ref_coords])
+        med_lng = statistics.median([c[1] for c in ref_coords])
+        # Дополнительно пробиваем плотный GPS-квадрат прямо вокруг центра улицы (радиус 850м)
+        zoom_queries = [
+            f"ресторан кафе пиццерия суши {loc}",
+            f"кофейня пекарня бар лаунж кальянная {loc}",
+            f"барбершоп салон красоты стоматология цветы {loc}",
+        ]
+        zoom_batches = await asyncio.gather(
+            *[_fetch_cat(zq, lat=med_lat, lng=med_lng, radius=850) for zq in zoom_queries]
+        )
+        for zb in zoom_batches:
+            raw_places.extend(zb)
 
     unique_places: List[PlaceInfo] = []
     seen_ids: set[str] = set()
     seen_brands: Dict[str, int] = {}
 
-    for batch in batches:
-        for p in batch:
-            if not p.place_id or p.place_id in seen_ids:
+    for p in raw_places:
+        if not p.place_id or p.place_id in seen_ids:
+            continue
+        low_name = (p.name or "").lower()
+        if any(w in low_name for w in STOP_NAME_WORDS):
+            continue
+        if any(ch in low_name for ch in CHAIN_BLACKLIST):
+            continue
+        clean_alpha = re.sub(r"[^a-zа-яё]+", " ", low_name).strip()
+        if clean_alpha in GENERIC_ONLY_NAMES:
+            continue
+
+        # Гео-фильтр: отсекаем случайные точки из других концов города (> 2.2 км от центра улицы)
+        if med_lat is not None and med_lng is not None and p.latitude and p.longitude:
+            dist_km = _haversine_km(med_lat, med_lng, p.latitude, p.longitude)
+            addr_low = (p.address or "").lower()
+            addr_lat = _cyr_to_latin(addr_low)
+            on_street = any(tok[:5] in addr_low or tok[:5] in addr_lat for tok in all_loc_tokens if len(tok) >= 3)
+            if not on_street and dist_km > 2.2:
                 continue
-            low_name = (p.name or "").lower()
-            if any(w in low_name for w in STOP_NAME_WORDS):
-                continue
-            if any(ch in low_name for ch in CHAIN_BLACKLIST):
-                continue
-            clean_alpha = re.sub(r"[^a-zа-яё]+", " ", low_name).strip()
-            if clean_alpha in GENERIC_ONLY_NAMES:
-                continue
-            b_key = _normalize_brand_key(p.name)
-            if b_key and seen_brands.get(b_key, 0) >= 1:
-                continue
-            seen_ids.add(p.place_id)
-            if b_key:
-                seen_brands[b_key] = seen_brands.get(b_key, 0) + 1
-            unique_places.append(p)
+
+        b_key = _normalize_brand_key(p.name)
+        if b_key and seen_brands.get(b_key, 0) >= 1:
+            continue
+        seen_ids.add(p.place_id)
+        if b_key:
+            seen_brands[b_key] = seen_brands.get(b_key, 0) + 1
+        unique_places.append(p)
 
     return unique_places
 
