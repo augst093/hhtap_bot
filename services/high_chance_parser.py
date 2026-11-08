@@ -72,7 +72,7 @@ class HighChanceLocationPack:
     insta_leads: List[HighChanceInstaLead] = field(default_factory=list)
 
 
-# Быстрые пресеты популярных коммерческих улиц Ташкента для выбора в 1 клик
+# Быстрые пресеты популярных коммерческих улиц Ташкента для выбора в 1 клик (Страница 1)
 POPULAR_LOCATIONS: Dict[str, str] = {
     "shevchenko": "Тараса Шевченко",
     "parkent": "Паркентская",
@@ -83,6 +83,22 @@ POPULAR_LOCATIONS: Dict[str, str] = {
     "chilanzar": "Чиланзар / Катартал",
     "boulevard": "Tashkent City / Boulevard",
 }
+
+# Дополнительные улицы и локации Ташкента (Страница 2)
+EXTRA_LOCATIONS: Dict[str, str] = {
+    "nukus": "Нукусская",
+    "babur": "Улица Бабура",
+    "azimov": "Садыка Азимова",
+    "makhtumkuli": "Махтумкули",
+    "labzak": "Лабзак / Ганга",
+    "ipakyuli": "Буюк Ипак Йули (Максимка)",
+    "novomoskovskaya": "Аккурган / Новомосковская",
+    "farhad": "Фархадский / Учтепа",
+    "sergeli": "Сергели / Янги Сергели",
+    "chorsu": "Чорсу / Самарканд Дарвоза",
+}
+
+ALL_PRESET_LOCATIONS: Dict[str, str] = {**POPULAR_LOCATIONS, **EXTRA_LOCATIONS}
 
 # Крупные сетевые гиганты и агрегаторы, которым не продают одиночные карты с улицы
 CHAIN_BLACKLIST = (
@@ -107,6 +123,11 @@ STREET_STOPWORDS = {
     "shevchenko", "шевченко", "taras", "тарас", "parkent", "паркент", "rustaveli",
     "руставели", "tashkent", "ташкент", "oybek", "ойбек", "mirabad", "мирабад",
     "chilanzar", "чиланзар", "yunusabad", "юнусабад", "boulevard", "c1", "ц1",
+    "nukus", "nukusskaya", "нукусская", "babur", "babura", "бабура", "azimov",
+    "azimova", "азимова", "makhtumkuli", "maxtumquli", "махтумкули", "labzak",
+    "лабзак", "ganga", "ганга", "maksimka", "максимка", "akkurgan", "аккурган",
+    "farhad", "farkhad", "фархадский", "uchtepa", "учтепа", "sergeli", "сергели",
+    "chorsu", "чорсу", "darvoza", "дарвоза", "ulitsa", "улица", "kocha", "kochasi",
 }
 
 DIRECTORY_DOMAINS = {
@@ -177,16 +198,54 @@ def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * r * math.asin(math.sqrt(a))
 
 
+async def _resolve_street_osm(loc_query: str) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """
+    Определяет точные GPS-координаты ЛЮБОЙ улицы/квартала/ориентира в Ташкенте
+    и его официальное узбекское/латинское название (например: 'улица Бабура' -> 'Bobur ko\\'chasi',
+    'улица Чехова' -> 'Fidokor ko\\'chasi', 'Нукусская' -> 'Nukus ko\\'chasi').
+    """
+    q = loc_query.strip()
+    if "ташкент" not in q.lower() and "tashkent" not in q.lower():
+        q = f"{q} Ташкент"
+    try:
+        async with httpx.AsyncClient(
+            headers={"User-Agent": "HHtapSalesBot/2.0 (Tashkent)"},
+            timeout=2.2,
+        ) as client:
+            r = await client.get(
+                "https://nominatim.openstreetmap.org/search",
+                params={"q": q, "format": "json", "limit": 2},
+            )
+            if r.status_code == 200:
+                data = r.json()
+                for item in data:
+                    disp = item.get("display_name", "")
+                    if any(c in disp.lower() for c in ("toshkent", "ташкент", "tashkent", "oʻzbekiston", "узбекистан")):
+                        lat = float(item["lat"])
+                        lon = float(item["lon"])
+                        osm_name = disp.split(",")[0].strip()
+                        return lat, lon, osm_name
+    except Exception as e:
+        logger.debug("Nominatim geocode fallback for '%s': %s", loc_query, e)
+    return None, None, None
+
+
 async def collect_all_location_places(location_query: str) -> List[PlaceInfo]:
     """
-    Параллельно сканирует заданную локацию по 8 коммерческим категориям + прицельному GPS-квадрату улицы,
-    вычисляет точный гео-центр улицы и отсекает случайные выбросы из других районов города (> 2.2 км).
+    Параллельно сканирует ЛЮБУЮ заданную улицу/локацию по коммерческим категориям
+    (как по русскому, так и по официальному узбекскому названию улицы в Google Maps),
+    вычисляет точный гео-центр улицы и отсекает случайные выбросы из других районов города.
     """
     loc = location_query.strip()
     if "ташкент" not in loc.lower() and "tashkent" not in loc.lower():
         loc_with_city = f"{loc} Ташкент"
     else:
         loc_with_city = loc
+
+    osm_lat, osm_lng, osm_street = await _resolve_street_osm(loc)
+    search_lat = osm_lat if osm_lat is not None else 41.3111
+    search_lng = osm_lng if osm_lng is not None else 69.2797
+    search_radius = 1200 if osm_lat is not None else 30000
 
     queries = [
         f"ресторан гастробар бистро {loc_with_city}",
@@ -198,8 +257,17 @@ async def collect_all_location_places(location_query: str) -> List[PlaceInfo]:
         f"стоматология dental клиника {loc_with_city}",
         f"цветы букеты подарки магазин {loc_with_city}",
     ]
+    if osm_street and osm_street.lower() not in loc.lower():
+        queries.extend(
+            [
+                f"ресторан кафе пиццерия {osm_street} Ташкент",
+                f"кофейня бар кальянная {osm_street} Ташкент",
+                f"барбершоп салон красоты {osm_street} Ташкент",
+                f"стоматология цветы {osm_street} Ташкент",
+            ]
+        )
 
-    async def _fetch_cat(q: str, lat: float = 41.3111, lng: float = 69.2797, radius: int = 30000) -> List[PlaceInfo]:
+    async def _fetch_cat(q: str, lat: float = search_lat, lng: float = search_lng, radius: int = search_radius) -> List[PlaceInfo]:
         try:
             return await asyncio.wait_for(
                 keyless_places_service.search_text(q, max_results=14, lat=lat, lng=lng, radius=radius),
@@ -212,10 +280,14 @@ async def collect_all_location_places(location_query: str) -> List[PlaceInfo]:
     batches = await asyncio.gather(*[_fetch_cat(q) for q in queries])
     raw_places: List[PlaceInfo] = [p for b in batches for p in b if p.place_id]
 
-    # Вычисляем точный GPS-центр выбранной улицы по точкам, чей адрес содержит название улицы
+    # Вычисляем точный GPS-центр выбранной улицы по точкам, чей адрес содержит название улицы (рус. или узб.)
+    raw_loc_str = f"{loc} {osm_street or ''}".lower()
     loc_words = [
-        w for w in re.findall(r"[a-zа-яё0-9]{3,}", loc.lower())
-        if w not in ("ташкент", "tashkent", "улица", "район", "квартал", "массив", "проспект")
+        w for w in re.findall(r"[a-zа-яё0-9]{3,}", raw_loc_str)
+        if w not in (
+            "ташкент", "tashkent", "toshkent", "улица", "район", "квартал",
+            "массив", "проспект", "ko", "chasi", "kochasi", "street", "ulitsa",
+        )
     ]
     loc_lat_words = [_cyr_to_latin(w) for w in loc_words]
     all_loc_tokens = set(loc_words + loc_lat_words)
@@ -230,12 +302,16 @@ async def collect_all_location_places(location_query: str) -> List[PlaceInfo]:
             if any(tok[:5] in addr_low or tok[:5] in addr_lat for tok in all_loc_tokens if len(tok) >= 3):
                 anchored_coords.append((p.latitude, p.longitude))
 
-    ref_coords = anchored_coords if len(anchored_coords) >= 2 else all_coords
-    med_lat: Optional[float] = None
-    med_lng: Optional[float] = None
-    if ref_coords:
-        med_lat = statistics.median([c[0] for c in ref_coords])
-        med_lng = statistics.median([c[1] for c in ref_coords])
+    med_lat: Optional[float] = osm_lat
+    med_lng: Optional[float] = osm_lng
+    if len(anchored_coords) >= 2:
+        med_lat = statistics.median([c[0] for c in anchored_coords])
+        med_lng = statistics.median([c[1] for c in anchored_coords])
+    elif med_lat is None and all_coords:
+        med_lat = statistics.median([c[0] for c in all_coords])
+        med_lng = statistics.median([c[1] for c in all_coords])
+
+    if med_lat is not None and med_lng is not None and not osm_street:
         # Дополнительно пробиваем плотный GPS-квадрат прямо вокруг центра улицы (радиус 850м)
         zoom_queries = [
             f"ресторан кафе пиццерия суши {loc}",
@@ -247,6 +323,20 @@ async def collect_all_location_places(location_query: str) -> List[PlaceInfo]:
         )
         for zb in zoom_batches:
             raw_places.extend(zb)
+
+    # Сортируем raw_places так, чтобы точки с прямым совпадением названия улицы в адресе шли первыми!
+    def _street_priority(p: PlaceInfo) -> Tuple[int, float]:
+        addr_low = f"{p.address or ''} {p.name or ''}".lower()
+        addr_lat = _cyr_to_latin(addr_low)
+        on_street = any(tok[:5] in addr_low or tok[:5] in addr_lat for tok in all_loc_tokens if len(tok) >= 3)
+        dist = (
+            _haversine_km(med_lat, med_lng, p.latitude, p.longitude)
+            if (med_lat is not None and med_lng is not None and p.latitude and p.longitude)
+            else 99.0
+        )
+        return (0 if on_street else 1, dist)
+
+    raw_places.sort(key=_street_priority)
 
     unique_places: List[PlaceInfo] = []
     seen_ids: set[str] = set()
@@ -264,13 +354,13 @@ async def collect_all_location_places(location_query: str) -> List[PlaceInfo]:
         if clean_alpha in GENERIC_ONLY_NAMES:
             continue
 
-        # Гео-фильтр: отсекаем случайные точки из других концов города (> 2.2 км от центра улицы)
+        # Гео-фильтр: оставляем точки на самой улице или в радиусе 1.6 км от центра улицы
         if med_lat is not None and med_lng is not None and p.latitude and p.longitude:
             dist_km = _haversine_km(med_lat, med_lng, p.latitude, p.longitude)
             addr_low = (p.address or "").lower()
             addr_lat = _cyr_to_latin(addr_low)
             on_street = any(tok[:5] in addr_low or tok[:5] in addr_lat for tok in all_loc_tokens if len(tok) >= 3)
-            if not on_street and dist_km > 2.2:
+            if not on_street and dist_km > 1.65:
                 continue
 
         b_key = _normalize_brand_key(p.name)
@@ -280,6 +370,60 @@ async def collect_all_location_places(location_query: str) -> List[PlaceInfo]:
         if b_key:
             seen_brands[b_key] = seen_brands.get(b_key, 0) + 1
         unique_places.append(p)
+
+    return unique_places
+
+
+async def collect_all_nearby_places(lat: float, lng: float, radius_km: float = 1.3) -> List[PlaceInfo]:
+    """
+    Сканирует ВСЕ коммерческие заведения вокруг точной GPS-геопозиции пользователя (радиус ~1.3 км),
+    чтобы работать на любой улице Ташкента даже без ввода названия улицы!
+    """
+    queries = [
+        "ресторан гастробар бистро стейк",
+        "пиццерия бургерная суши роллы донер",
+        "кафе кофейня пекарня кондитерская",
+        "бар паб лаунж кальянная",
+        "барбершоп мужская парикмахерская",
+        "салон красоты косметология спа",
+        "стоматология dental клиника",
+        "цветы букеты подарки магазин",
+    ]
+
+    async def _fetch_near(q: str) -> List[PlaceInfo]:
+        try:
+            return await asyncio.wait_for(
+                keyless_places_service.search_text(q, max_results=15, lat=lat, lng=lng, radius=750),
+                timeout=4.5,
+            )
+        except Exception:
+            return []
+
+    batches = await asyncio.gather(*[_fetch_near(q) for q in queries])
+    unique_places: List[PlaceInfo] = []
+    seen_ids: set[str] = set()
+    seen_brands: Dict[str, int] = {}
+
+    for batch in batches:
+        for p in batch:
+            if not p.place_id or p.place_id in seen_ids:
+                continue
+            low_name = (p.name or "").lower()
+            if any(w in low_name for w in STOP_NAME_WORDS) or any(ch in low_name for ch in CHAIN_BLACKLIST):
+                continue
+            clean_alpha = re.sub(r"[^a-zа-яё]+", " ", low_name).strip()
+            if clean_alpha in GENERIC_ONLY_NAMES:
+                continue
+            if p.latitude and p.longitude:
+                if _haversine_km(lat, lng, p.latitude, p.longitude) > radius_km:
+                    continue
+            b_key = _normalize_brand_key(p.name)
+            if b_key and seen_brands.get(b_key, 0) >= 1:
+                continue
+            seen_ids.add(p.place_id)
+            if b_key:
+                seen_brands[b_key] = seen_brands.get(b_key, 0) + 1
+            unique_places.append(p)
 
     return unique_places
 
