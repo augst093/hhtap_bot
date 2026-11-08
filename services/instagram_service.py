@@ -2,8 +2,8 @@
 Сервис обработки, мгновенного поиска и генерации ссылок для модуля Instagram NFC (HHtap).
 Поддерживает:
 - Извлечение и валидацию чистого username из любого формата (@nick, nick, https://instagram.com/nick?igsh=...)
-- Мгновенный поиск официального Instagram-аккаунта любого бизнеса по названию с припиской insta/инста
-  (например: 'Kamolon Osh insta', 'Камолон Ош инста', 'Roni инста', 'Soul Bakery Паркент insta')
+- Мгновенный 4-уровневый поиск официального Instagram-аккаунта любого бизнеса по названию с припиской insta/инста
+  (например: 'Kamolon Osh insta', 'Камолон Ош инста', 'Roni инста', 'Breadly инста', 'Про Хинкали инста')
 - Генерацию двух проверенных форматов ссылок для записи в NFC Tools (Web Handle + Deep Link)
 - Автоопределение Instagram-запросов в общем потоке сообщений
 """
@@ -11,6 +11,7 @@ import asyncio
 import html
 import logging
 import re
+import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -36,6 +37,12 @@ RESERVED_IG_PATHS = {
     "session",
     "_u",
     "share",
+    "popular",
+    "seo",
+    "sem",
+    "directory",
+    "tags",
+    "locations",
 }
 
 # Валидный username в Instagram: от 1 до 30 символов (буквы латиницы, цифры, точка, нижнее подчеркивание)
@@ -250,7 +257,6 @@ def is_instagram_input(text: str, mode_hint: str = "google") -> bool:
         if validate_ig_username(first_tok) is not None:
             if len(stripped.split()) == 1:
                 return True
-            # '@kamolonosh insta'
             if re.match(rf"^@[A-Za-z0-9._]{{1,30}}\s+{INSTA_TRIGGER_WORDS}$", stripped, re.IGNORECASE):
                 return True
 
@@ -339,24 +345,30 @@ def format_instagram_card(data: InstagramCardData, searched_query: Optional[str]
 
 
 # ==============================================================================
-# МГНОВЕННЫЙ ПОИСК INSTAGRAM БИЗНЕСА ПО НАЗВАНИЮ ("Kamolon Osh insta")
+# МГНОВЕННЫЙ 4-УРОВНЕВЫЙ ПОИСК INSTAGRAM БИЗНЕСА ПО НАЗВАНИЮ
 # ==============================================================================
 
-def _cyr_to_latin(text: str, y_as_i: bool = False) -> str:
-    """Транслитерирует название бизнеса из кириллицы в латиницу с учётом брендов Ташкента."""
+def _cyr_to_latin(text: str, y_as_i: bool = False, kh_mode: bool = False, k_as_c: bool = False) -> str:
+    """Транслитерирует название бизнеса из кириллицы в латиницу во всех возможных вариантах написания."""
     low = text.lower()
     replacements = [
         ("жигули", "jiguli"),
         ("джиотто", "giotto"),
         ("джотто", "giotto"),
+        ("кукучина", "cucucina"),
         ("козон", "qozon"),
         ("казон", "qozon"),
         ("камолон", "kamolon"),
         ("афсона", "afsona"),
         ("сафия", "safia"),
+        ("брэдли", "breadly"),
+        ("бредли", "breadly"),
+        ("бенедикт", "benedict"),
         ("япона мама", "yaponamama"),
         ("японамама", "yaponamama"),
         ("сыроварня", "sirovarnya" if y_as_i else "syrovarnya"),
+        ("хинкали", "khinkali" if kh_mode else "xinkali"),
+        ("караван", "caravan" if k_as_c else "karavan"),
         ("пекарня", "bakery"),
         ("кофейня", "coffee"),
         ("ресторан", "restaurant"),
@@ -369,6 +381,10 @@ def _cyr_to_latin(text: str, y_as_i: bool = False) -> str:
     for ch in low:
         if y_as_i and ch == "ы":
             out.append("i")
+        elif kh_mode and ch == "х":
+            out.append("kh")
+        elif k_as_c and ch == "к":
+            out.append("c")
         else:
             out.append(CYR_TO_LAT.get(ch, ch))
     return "".join(out)
@@ -397,26 +413,32 @@ GENERIC_PLACE_WORDS = {
     "tashkent", "toshkent", "tashkente", "uzbekistan", "parkent", "shevchenko",
     "mirabad", "city", "street", "avenue", "restaurant", "restoran", "cafe",
     "kafe", "coffee", "bakery", "bar", "pub", "lounge", "pizza", "pizzeria",
-    "oshxona", "choyxona", "markazi", "filial", "v", "na", "ulitsa",
+    "oshxona", "choyxona", "markazi", "filial", "v", "na", "ulitsa", "co",
+    "novomoskovskaya", "ekopark",
 }
 
 
-def _extract_brand_words(raw_text: str, y_as_i: bool = False) -> List[str]:
-    lat = _cyr_to_latin(raw_text, y_as_i=y_as_i)
+def _extract_brand_words(raw_text: str, y_as_i: bool = False, kh_mode: bool = False, k_as_c: bool = False) -> List[str]:
+    lat = _cyr_to_latin(raw_text, y_as_i=y_as_i, kh_mode=kh_mode, k_as_c=k_as_c)
     all_words = re.findall(r"[a-z0-9]{2,}", lat)
     filtered = [w for w in all_words if w not in GENERIC_PLACE_WORDS]
     return filtered if filtered else all_words
 
 
-def _build_candidate_handles(raw_query: str, places: list, website_igs: List[str]) -> List[str]:
+def _build_candidate_handles(
+    raw_query: str,
+    places: list,
+    website_igs: List[str],
+    search_engine_igs: List[str],
+) -> List[str]:
     cands: List[str] = []
 
     def add(h: str):
-        v = validate_ig_username(h.lower())
+        v = validate_ig_username(h.lower().rstrip("."))
         if v and len(v) >= 2 and v not in cands:
             cands.append(v)
 
-    # 1. Прямые ссылки на Instagram с Google Maps и с официального сайта точки
+    # 1. Прямые ссылки на Instagram с Google Maps, с официального сайта точки и из поисковиков
     for p in (places or [])[:3]:
         w = (p.website or "").strip()
         if not w:
@@ -433,29 +455,50 @@ def _build_candidate_handles(raw_query: str, places: list, website_igs: List[str
     for u in website_igs:
         add(u)
 
-    # 2. Домен официального сайта из Google Maps (например kamolonosh.uz -> kamolonosh)
+    for u in search_engine_igs:
+        add(u)
+
+    # 2. Домен и путь официального сайта из Google Maps (например benedict-cafe.uz, lali.rest, /prohinkalytashkent/)
     for p in (places or [])[:3]:
         w = (p.website or "").strip()
         if not w:
             continue
-        m_dom = re.search(r"https?://(?:www\.)?([a-z0-9\-]+)\.(?:uz|com|ru|rest|cafe|org)", w, re.IGNORECASE)
+        m_dom = re.search(r"https?://(?:www\.)?([a-z0-9\-]+)\.(uz|com|ru|rest|cafe|bar|org)(?:/([a-z0-9._\-]{3,30}))?", w, re.IGNORECASE)
         if m_dom:
-            stem = m_dom.group(1).replace("-", "").lower()
-            if stem not in ("taplink", "instagram", "facebook", "google", "abnmbgroup", "t", "bit", "linktr"):
+            raw_host = m_dom.group(1).lower()
+            tld = m_dom.group(2).lower()
+            path_seg = (m_dom.group(3) or "").lower().strip("/")
+            stem = raw_host.replace("-", "")
+            if stem not in ("taplink", "instagram", "facebook", "google", "abnmbgroup", "familygarden", "t", "bit", "linktr"):
+                add(f"{stem}.{tld}")
                 add(stem)
-                add(f"{stem}uz")
                 add(f"{stem}_uz")
                 add(f"{stem}.uz")
+                add(f"{stem}uz")
+                add(f"{stem}_tashkent")
+                add(f"{stem}.tashkent")
+                if "-" in raw_host:
+                    under_host = raw_host.replace("-", "_")
+                    dot_host = raw_host.replace("-", ".")
+                    add(under_host)
+                    add(f"{under_host}_tashkent")
+                    add(f"{under_host}_uz")
+                    add(dot_host)
+            if path_seg and path_seg not in ("ru", "uz", "en", "home", "index", "menu"):
+                add(path_seg.replace("-", "_"))
+                add(path_seg.replace("-", ""))
 
-    # 3. Генерация комбинаций из запроса пользователя (в двух вариантах транслитерации) и названия в Google Maps
+    # 3. Генерация комбинаций из запроса пользователя (во всех вариантах транслитерации) и названия в Google Maps
     word_sets = [
-        _extract_brand_words(raw_query, y_as_i=False),
-        _extract_brand_words(raw_query, y_as_i=True),
+        _extract_brand_words(raw_query, y_as_i=False, kh_mode=True, k_as_c=False),
+        _extract_brand_words(raw_query, y_as_i=False, kh_mode=False, k_as_c=False),
+        _extract_brand_words(raw_query, y_as_i=True, kh_mode=True, k_as_c=True),
     ]
     if places:
-        word_sets.append(_extract_brand_words(places[0].name, y_as_i=False))
-        word_sets.append(_extract_brand_words(places[0].name, y_as_i=True))
+        word_sets.append(_extract_brand_words(places[0].name, y_as_i=False, kh_mode=True, k_as_c=False))
+        word_sets.append(_extract_brand_words(places[0].name, y_as_i=True, kh_mode=False, k_as_c=True))
 
+    # Сначала добавляем самые высокоприоритетные паттерны Ташкента для всех вариантов слов
     for words in word_sets:
         if not words:
             continue
@@ -464,29 +507,38 @@ def _build_candidate_handles(raw_query: str, places: list, website_igs: List[str
         under2 = "_".join(words[:2])
         dot2 = ".".join(words[:2])
 
-        for base in (joined2, under2, dot2, w1):
+        # Если 3 слова (например 'Testo by Zamira' или 'Black Bear Kofi')
+        if len(words) >= 3:
+            add("_".join(words[:3]))
+            add("".join(words[:3]))
+            add(".".join(words[:3]))
+
+        # Если 2 и более слов — сначала проверяем двусловные комбинации (joined2, under2, dot2), а затем w1
+        bases_order = (joined2, under2, dot2, w1) if len(words) >= 2 else (w1,)
+        for base in bases_order:
             add(base)
-            add(f"{base}uz")
             add(f"{base}_uz")
             add(f"{base}.uz")
+            add(f"{base}uz")
+            add(f"{base}.uzb")
             add(f"{base}_tashkent")
+            add(f"{base}.tashkent")
             add(f"{base}tashkent")
+            add(f"{base}_restaurant")
+            add(f"{base}.restaurant")
+            add(f"{base}_rest")
 
         add(f"{w1}_uzbekistan")
-        add(f"{w1}uzbekistan")
-        add(f"{w1}_rest")
-        add(f"{w1}_restaurant")
-        add(f"{w1}.restaurant")
         add(f"{w1}cafe.uz")
         add(f"{w1}_cafe")
+        add(f"{w1}_cafe_tashkent")
+        add(f"{w1}_boulangerie")
         add(f"{w1}.bar")
         add(f"{w1}_bar")
         add(f"{w1}bakery_uz")
-        add(f"{w1}_bakery")
         add(f"{w1}pizzauz")
-        add(f"{w1}_pizza_uz")
 
-    return cands[:20]
+    return cands[:36]
 
 
 async def _extract_ig_from_external_website(url: str) -> List[str]:
@@ -500,7 +552,7 @@ async def _extract_ig_from_external_website(url: str) -> List[str]:
             r = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
             if r.status_code == 200:
                 for m in re.finditer(r"instagram\.com/(?:_u/)?([A-Za-z0-9._]{2,30})", r.text, re.IGNORECASE):
-                    v = validate_ig_username(m.group(1).lower())
+                    v = validate_ig_username(m.group(1).lower().rstrip("."))
                     if v and v not in found:
                         found.append(v)
 
@@ -511,10 +563,56 @@ async def _extract_ig_from_external_website(url: str) -> List[str]:
     return found
 
 
+async def _search_web_instagram_handles(biz_query: str) -> List[str]:
+    """
+    Параллельный поиск Instagram-аккаунта бизнеса через поисковые зеркала Yahoo (до 1.8 сек).
+    Находит нестандартные никнеймы (например @breadly_boulangerie, @benedict_nukus_tashkent, @testo_by_zamira).
+    """
+    uq = urllib.parse.quote(f"{biz_query} Ташкент instagram")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    }
+    mirrors = [
+        f"https://search.yahoo.com/search?p={uq}",
+        f"https://uk.search.yahoo.com/search?p={uq}",
+    ]
+    found: List[str] = []
+
+    async def _query_mirror(url: str) -> List[str]:
+        loc: List[str] = []
+        try:
+            async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=1.6) as c:
+                r = await c.get(url)
+                if r.status_code == 200:
+                    txt = urllib.parse.unquote(r.text)
+                    for m in re.finditer(r"instagram\.com/(?:_u/)?([A-Za-z0-9._]{3,30})", txt, re.IGNORECASE):
+                        v = validate_ig_username(m.group(1).lower().rstrip("."))
+                        if v and v not in loc:
+                            loc.append(v)
+        except Exception:
+            pass
+        return loc
+
+    try:
+        res_lists = await asyncio.wait_for(
+            asyncio.gather(*[_query_mirror(u) for u in mirrors]),
+            timeout=1.9,
+        )
+        for lst in res_lists:
+            for item in lst:
+                if item not in found:
+                    found.append(item)
+    except Exception:
+        pass
+    return found[:6]
+
+
 async def resolve_business_instagram(biz_query: str) -> List[Dict[str, Any]]:
     """
-    Мгновенно находит и верифицирует реальный Instagram-аккаунт бизнеса по его названию
-    (на латинице или кириллице, например 'Kamolon Osh', 'Камолон Ош', 'Soul Bakery Паркент', 'Roni').
+    Мгновенно находит и верифицирует реальный Instagram-аккаунт любого бизнеса по его названию
+    (на латинице или кириллице, например 'Kamolon Osh', 'Камолон Ош', 'Soul Bakery Паркент', 'Breadly', 'Про Хинкали').
     Возвращает отсортированный по релевантности список словарей:
       [{"username": "kamolonosh", "title": "...", "followers": 224000, "score": ...}, ...]
     """
@@ -524,15 +622,21 @@ async def resolve_business_instagram(biz_query: str) -> List[Dict[str, Any]]:
     if not clean_q:
         return []
 
-    # 1. Быстрый HTTP-поиск карточки бизнеса в Google Maps (~0.4–0.6 сек)
-    places = []
-    try:
-        places = await asyncio.wait_for(
-            keyless_places_service.search_text(clean_q, max_results=3),
-            timeout=4.5,
-        )
-    except Exception as e:
-        logger.warning("Ошибка поиска Google Maps внутри resolve_business_instagram('%s'): %s", clean_q, e)
+    # 1. Параллельно запускаем HTTP-поиск в Google Картах и веб-поиск нестандартных никнеймов
+    async def _safe_gmaps():
+        try:
+            return await asyncio.wait_for(
+                keyless_places_service.search_text(clean_q, max_results=3),
+                timeout=3.5,
+            )
+        except Exception as e:
+            logger.warning("Ошибка поиска Google Maps внутри resolve_business_instagram('%s'): %s", clean_q, e)
+            return []
+
+    places, search_engine_igs = await asyncio.gather(
+        _safe_gmaps(),
+        _search_web_instagram_handles(clean_q),
+    )
 
     direct_gmaps_ig: Optional[str] = None
     taplink_handles: set[str] = set()
@@ -572,16 +676,20 @@ async def resolve_business_instagram(biz_query: str) -> List[Dict[str, Any]]:
                 if u not in website_igs:
                     website_igs.append(u)
 
-    # 3. Генерируем список кандидатов и параллельно проверяем их через метаданные Instagram
-    candidates = _build_candidate_handles(clean_q, places, website_igs)
+    # 3. Генерируем список кандидатов и параллельно проверяем их через живые метаданные Instagram
+    candidates = _build_candidate_handles(clean_q, places, website_igs, search_engine_igs)
     if not candidates:
         return []
 
-    brand_words_y = _extract_brand_words(clean_q, y_as_i=False)
-    brand_words_i = _extract_brand_words(clean_q, y_as_i=True)
-    brand_words = list(dict.fromkeys(brand_words_y + brand_words_i))
+    brand_words = list(
+        dict.fromkeys(
+            _extract_brand_words(clean_q, y_as_i=False, kh_mode=True, k_as_c=False)
+            + _extract_brand_words(clean_q, y_as_i=False, kh_mode=False, k_as_c=False)
+            + _extract_brand_words(clean_q, y_as_i=True, kh_mode=True, k_as_c=True)
+        )
+    )
     raw_query_words = [
-        w for w in re.findall(r"[a-z0-9]{3,}", _cyr_to_latin(clean_q, y_as_i=False))
+        w for w in re.findall(r"[a-z0-9]{3,}", _cyr_to_latin(clean_q, y_as_i=False, kh_mode=True))
         if w not in ("tashkent", "toshkent", "uzbekistan", "parkent", "shevchenko")
     ]
 
@@ -616,28 +724,28 @@ async def resolve_business_instagram(biz_query: str) -> List[Dict[str, Any]]:
 
     uz_markers = ("uz", "tashkent", "toshkent", "ташкент", "узбекистан", "osh", "qozon", "birlashtiradi")
     biz_markers = (
-        "rest", "cafe", "bar", "bakery", "pizza", "lounge", "coffee", "pub", "bistro", "burger",
-        "sushi", "wok", "rolls", "clinic", "dental", "med", "beauty", "salon", "barber", "school",
-        "edu", "shop", "store", "ресторан", "кафе", "кофейня", "пекарня", "бар", "пицц", "суши",
-        "клиника", "салон", "школа", "магазин",
+        "rest", "cafe", "bar", "bakery", "boulangerie", "pizza", "lounge", "coffee", "kofi", "pub", "bistro",
+        "burger", "sushi", "wok", "rolls", "khinkali", "hinkali", "xinkali", "clinic", "dental", "med",
+        "beauty", "salon", "barber", "school", "edu", "shop", "store", "gullari", "flowers",
+        "ресторан", "кафе", "кофейня", "пекарня", "бар", "пицц", "суши", "хинкал", "клиника", "салон", "школа", "магазин", "букет", "цвет",
     )
 
     def score_profile(prof: Dict[str, Any]) -> float:
         u = prof["username"].lower()
         raw_title_low = prof["title"].lower()
-        title_lat_y = _cyr_to_latin(raw_title_low, y_as_i=False)
-        title_lat_i = _cyr_to_latin(raw_title_low, y_as_i=True)
+        title_lat_y = _cyr_to_latin(raw_title_low, y_as_i=False, kh_mode=True)
+        title_lat_i = _cyr_to_latin(raw_title_low, y_as_i=True, kh_mode=False)
         u_clean = re.sub(r"[._]", "", u)
         sc = 0.0
 
-        # Если этот аккаунт напрямую прописан в поле Сайт на Google Картах
+        # 1. Если этот аккаунт напрямую прописан в поле Сайт на Google Картах
         if direct_gmaps_ig and u == direct_gmaps_ig:
             sc += 600.0
 
         if u in taplink_handles:
             sc += 220.0
 
-        # Совпадение ключевых слов бренда в заголовке профиля и в никнейме
+        # 2. Совпадение ключевых слов бренда в заголовке профиля и в никнейме
         matched_brand = False
         for bw in brand_words:
             if len(bw) >= 3:
@@ -645,7 +753,7 @@ async def resolve_business_instagram(biz_query: str) -> List[Dict[str, Any]]:
                     sc += 95.0
                     matched_brand = True
                 if bw in u_clean:
-                    sc += 75.0
+                    sc += 80.0
                     matched_brand = True
 
         # Дополнительный бонус за совпадение второго слова из запроса (например 'bar' в 'Жигули Бар' -> @jiguli.bar)
@@ -656,32 +764,52 @@ async def resolve_business_instagram(biz_query: str) -> List[Dict[str, Any]]:
                 if qw in title_lat_y or qw in raw_title_low:
                     sc += 45.0
 
-        # Если ссылка найдена на внешнем сайте точки (например giotto.uz -> @giotto.uz)
+        # 3. Если ссылка найдена на внешнем сайте точки или через веб-поиск по Ташкенту
         if u in website_igs:
             if matched_brand or prof["followers"] >= 1000:
                 sc += 240.0
             else:
                 sc += 40.0
 
-        has_uz = any(m in u or m in raw_title_low or m in title_lat_y for m in uz_markers)
+        if u in search_engine_igs:
+            if matched_brand:
+                rank_idx = search_engine_igs.index(u)
+                sc += max(90.0, 185.0 - rank_idx * 25.0)
+
+        # 4. Признаки Ташкента / Узбекистана и коммерческого бизнеса
         has_biz = any(m in u or m in raw_title_low or m in title_lat_y for m in biz_markers)
+        has_cyrillic_title = bool(re.search(r"[а-яА-ЯёЁўқғҳ]", raw_title_low))
+        strong_uz_markers = ("_uz", ".uz", "uzb", "tashkent", "toshkent", "ташкент", "узбекистан", "osh", "qozon", "birlashtiradi")
+        has_uz = any(m in u or m in raw_title_low or m in title_lat_y for m in strong_uz_markers)
+        if not has_uz and u.endswith("uz"):
+            # Защита от случайных иностранных личных анкет вида @benedictuz (188 подп., без бизнеса и без кириллицы)
+            if prof["followers"] >= 500 or has_biz or has_cyrillic_title:
+                has_uz = True
+
         if has_uz:
-            sc += 120.0
+            sc += 130.0
         if has_biz:
             sc += 85.0
+        if has_cyrillic_title:
+            sc += 35.0
 
-        # Штраф для коротких однословных глобальных аккаунтов людей/знаменитостей без признаков бизнеса/Узбекистана
-        if len(brand_words) <= 2 and len(u) <= 6 and not has_uz and not has_biz:
-            sc -= 190.0
+        # Штраф для чужих городов и стран в никнейме/заголовке (например dushanbe, almaty, moscow, istanbul/İstanbul)
+        foreign_markers = ("dushanbe", "almaty", "astana", "moscow", "spb", "stanbul", "baku", "bishkek", "kazan")
+        if any(fm in u or fm in raw_title_low for fm in foreign_markers) or re.search(r"[\u4e00-\u9fff]", raw_title_low):
+            sc -= 320.0
 
-        # Бонус за живую аудиторию подписчиков (чем крупнее реальный бренд, тем выше приоритет)
+        # Штраф для голых однословных глобальных аккаунтов людей/знаменитостей без признаков бизнеса/Узбекистана/кириллицы
+        if ("_" not in u and "." not in u) and not has_uz and not has_biz and not has_cyrillic_title:
+            sc -= 240.0
+
+        # 5. Бонус за живую аудиторию подписчиков
         f = prof["followers"]
         if f >= 50_000:
-            sc += 145.0
+            sc += 210.0
         elif f >= 10_000:
-            sc += 125.0
+            sc += 140.0
         elif f >= 3_000:
-            sc += 90.0
+            sc += 95.0
         elif f >= 500:
             sc += 55.0
         elif f < 50:
