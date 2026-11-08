@@ -54,6 +54,15 @@ from services.lead_hunter import (
     lead_hunter_service,
     parse_uz_phone,
 )
+from services.high_chance_parser import (
+    POPULAR_LOCATIONS,
+    HighChanceGoogleLead,
+    HighChanceInstaLead,
+    HighChanceLocationPack,
+    collect_all_location_places,
+    rank_google_reviews_leads,
+    rank_instagram_low_followers_leads,
+)
 
 # Настройка логирования
 logging.basicConfig(
@@ -82,6 +91,7 @@ OBJECTION_TITLES = {
 }
 
 # Тексты кнопок выбора режима и нижнего меню
+BTN_HIGH_CHANCE = "🎯 Парсер высоких шансов продаж"
 BTN_MODE_GOOGLE = "⭐️ Google Reviews NFC"
 BTN_MODE_INSTA = "📸 Instagram NFC"
 BTN_HUNT_MENU = "🎯 Автопоиск ТОП-лидов"
@@ -92,6 +102,14 @@ BTN_RESET_SEEN = "🔄 Сбросить просмотренные"
 
 # Текущий выбранный режим пользователя: "google" (по умолчанию) или "insta"
 user_modes: Dict[int, str] = {}
+# Ожидание ввода локации для Парсера высоких шансов продаж: user_id -> "google" | "insta" | "choose"
+user_hc_pending_mode: Dict[int, str] = {}
+# Последняя введённая пользователем локация для быстрого переключения в 1 клик
+user_last_hc_location: Dict[int, str] = {}
+# Кэш собранных локаций Парсера высоких шансов продаж (пачки по 5 бизнесов)
+hc_pack_cache: Dict[str, HighChanceLocationPack] = {}
+# Кэш уже отсканированных списков мест по названию локации: location_lower -> List[PlaceInfo]
+hc_places_cache: Dict[str, List[PlaceInfo]] = {}
 
 
 # ==============================================================================
@@ -188,9 +206,12 @@ def cache_carousel_batch(
 # Клавиатуры и карточки
 # ==============================================================================
 def make_main_reply_keyboard() -> ReplyKeyboardMarkup:
-    """Постоянное нижнее меню с быстрым переключением режимов (Google Reviews / Instagram NFC) и Автопоиском."""
+    """Постоянное нижнее меню с Парсером высоких шансов продаж, режимами (Google Reviews / Instagram NFC) и Автопоиском."""
     return ReplyKeyboardMarkup(
         keyboard=[
+            [
+                KeyboardButton(text=BTN_HIGH_CHANCE),
+            ],
             [
                 KeyboardButton(text=BTN_MODE_GOOGLE),
                 KeyboardButton(text=BTN_MODE_INSTA),
@@ -215,6 +236,12 @@ def make_start_mode_inline_keyboard() -> InlineKeyboardMarkup:
     """Стартовое Inline-меню выбора режима работы бота."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🎯 Парсер высоких шансов продаж",
+                    callback_data="hc:menu",
+                )
+            ],
             [
                 InlineKeyboardButton(
                     text="⭐️ Google Reviews NFC",
@@ -981,10 +1008,10 @@ def format_main_welcome_text() -> str:
         "👋 <b>Добро пожаловать в комбайн лидогенерации HHtap!</b>\n\n"
         f"{mode_desc}\n"
         f"{ai_desc}\n\n"
-        "🧭 <b>ДВА РАБОЧИХ МОДУЛЯ БОТА:</b>\n"
-        "1️⃣ <b>⭐️ Google Reviews NFC:</b> автопоиск ТОП-5 заведений по улицам Ташкента, прямые 5⭐️ ссылки для NFC Tools, контакты и ИИ-питчи.\n"
-        "2️⃣ <b>📸 Instagram NFC:</b> мгновенный поиск Instagram любого бизнеса по названию с припиской <code>инста</code>/<code>insta</code> (например: <code>Kamolon Osh insta</code> или <code>Камолон Ош инста</code>), либо по <code>@username</code> / ссылке!\n\n"
-        "💡 <i>Оба парсера работают одновременно: пишите название точки для Google Карт или добавьте в конце <code>инста</code> / <code>insta</code>, чтобы бот сам нашёл её Instagram и выдал NFC-ссылки!</i>"
+        "🧭 <b>ТРИ РАБОЧИХ МОДУЛЯ БОТА:</b>\n"
+        "1️⃣ <b>🎯 Парсер высоких шансов продаж (ПО ЛОКАЦИИ):</b> собирает ВСЕ бизнесы на выбранной улице и выдаёт пачками по <b>5 ЛУЧШИХ</b> в двух режимах: <b>⭐️ Google Reviews</b> (плохие отзывы / мало оценок) и <b>📸 Instagram</b> (мало подписчиков / слабый поток)!\n"
+        "2️⃣ <b>⭐️ Google Reviews NFC:</b> точечный поиск заведений, 2 прямые ссылки для NFC Tools, контакты и ИИ-питчи.\n"
+        "3️⃣ <b>📸 Instagram NFC:</b> мгновенный поиск Instagram любого бизнеса по названию с припиской <code>инста</code>/<code>insta</code> (например: <code>Kamolon Osh insta</code> или <code>Камолон Ош инста</code>), либо по <code>@username</code> / ссылке!"
     )
 
 
@@ -1005,6 +1032,7 @@ async def cmd_start(message: Message):
     """Приветственное сообщение, нижняя клавиатура и стартовое меню выбора режима."""
     if message.from_user:
         user_modes[message.from_user.id] = "google"
+        user_hc_pending_mode.pop(message.from_user.id, None)
 
     await message.answer(
         format_main_welcome_text(),
@@ -1012,10 +1040,610 @@ async def cmd_start(message: Message):
         reply_markup=make_main_reply_keyboard(),
     )
     await message.answer(
-        "👇 <b>Выберите режим работы или просто отправьте запрос в чат:</b>",
+        "👇 <b>Выберите режим работы или нажмите «🎯 Парсер высоких шансов продаж»:</b>",
         parse_mode=ParseMode.HTML,
         reply_markup=make_start_mode_inline_keyboard(),
     )
+
+
+# ==============================================================================
+# 🎯 ПАРСЕР ВЫСОКИХ ШАНСОВ ПРОДАЖ ПО ЛОКАЦИИ (Пачки по 5 лучших бизнесов)
+# ==============================================================================
+HC_PAGE_SIZE = 5
+
+
+def make_hc_main_inline_keyboard(last_loc: Optional[str] = None) -> InlineKeyboardMarkup:
+    """
+    Две главные ИНЛАЙН-КНОПКИ внутри Парсера высоких шансов продаж:
+    1) ⭐️ Google Reviews (плохие отзывы и их малое количество)
+    2) 📸 Instagram (мало подписчиков и слабый поток из инсты)
+    """
+    rows: List[List[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="⭐️ Google Reviews (Плохие отзывы / мало оценок)",
+                callback_data="hc:mode:google",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="📸 Instagram (Мало подписчиков / слабый поток)",
+                callback_data="hc:mode:insta",
+            )
+        ],
+    ]
+    if last_loc:
+        short_loc = last_loc[:22]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"⚡ Google Reviews: {short_loc}",
+                    callback_data="hc:run_last:google",
+                ),
+                InlineKeyboardButton(
+                    text=f"⚡ Instagram: {short_loc}",
+                    callback_data="hc:run_last:insta",
+                ),
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def make_hc_location_keyboard(mode: str, last_loc: Optional[str] = None) -> InlineKeyboardMarkup:
+    """Инлайн-клавиатура быстрого выбора улицы/локации + возможность написать любую улицу текстом."""
+    rows: List[List[InlineKeyboardButton]] = []
+    if last_loc:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🚀 Пробить локацию: «{last_loc[:26]}»",
+                    callback_data=f"hc:run_last:{mode}",
+                )
+            ]
+        )
+
+    loc_items = list(POPULAR_LOCATIONS.items())
+    for i in range(0, len(loc_items), 2):
+        pair = loc_items[i : i + 2]
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"📍 {title}",
+                    callback_data=f"hc:loc:{mode}:{key}",
+                )
+                for key, title in pair
+            ]
+        )
+
+    other_mode = "insta" if mode == "google" else "google"
+    other_label = "📸 Переключить на Instagram" if other_mode == "insta" else "⭐️ Переключить на Google Reviews"
+    rows.append(
+        [
+            InlineKeyboardButton(text=other_label, callback_data=f"hc:mode:{other_mode}"),
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="hc:menu"),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def format_hc_menu_text(last_loc: Optional[str] = None) -> str:
+    loc_hint = (
+        f"\n📍 <b>Текущая выбранная локация:</b> <code>{html.escape(last_loc)}</code>\n"
+        if last_loc
+        else ""
+    )
+    return (
+        "🎯 <b>Парсер высоких шансов продаж (По локации)</b>\n\n"
+        "Бот автономно собирает <b>ВСЕ бизнесы с указанной вами локации</b>, "
+        "вычисляет их главную боль и выдаёт <b>пачками по 5 ЛУЧШИХ заведений</b> "
+        "(с кнопками <b>⬅️ Назад</b> и <b>Дальше (Ещё 5) ➡️</b>):\n\n"
+        "1️⃣ <b>⭐️ Google Reviews</b> — ищет бизнесы на локации с <b>плохими отзывами и малым количеством оценок</b> (острая боль репутации в картах).\n"
+        "2️⃣ <b>📸 Instagram</b> — ищет бизнесы на локации, у которых <b>мало подписчиков в Инсте и слабый поток гостей</b> (идеально под продажу Instagram NFC-карт!).\n"
+        f"{loc_hint}\n"
+        "👇 <b>Нажмите на нужный режим ниже (или сразу напишите улицу/локацию в чат):</b>"
+    )
+
+
+def format_hc_pack_page(
+    pack: HighChanceLocationPack,
+    mode: str,
+    page_idx: int,
+) -> str:
+    """Форматирует пачку из 5 ЛУЧШИХ бизнесов на локации для выбранного режима."""
+    items = pack.google_leads if mode == "google" else pack.insta_leads
+    total = len(items)
+    if total == 0:
+        mode_title = "Google Reviews" if mode == "google" else "Instagram"
+        return (
+            f"🔍 <b>На локации «{html.escape(pack.location_query)}» подходящих лидов ({mode_title}) не найдено.</b>\n\n"
+            "Попробуйте указать соседнюю улицу или более широкую локацию."
+        )
+
+    total_pages = max(1, (total + HC_PAGE_SIZE - 1) // HC_PAGE_SIZE)
+    page_idx = max(0, min(page_idx, total_pages - 1))
+    start = page_idx * HC_PAGE_SIZE
+    end = min(start + HC_PAGE_SIZE, total)
+    page_slice = items[start:end]
+
+    if mode == "google":
+        lines = [
+            f"🎯 <b>ТОП БИЗНЕСОВ: ⭐️ GOOGLE REVIEWS (Плохие отзывы / Мало оценок)</b>",
+            f"📍 Локация: <b>{html.escape(pack.location_query)}</b> • Собрано: <b>{total}</b> (проверено {pack.total_scanned} точек)",
+            f"📦 <b>Пачка #{page_idx + 1} из {total_pages} (Показаны {start + 1}–{end} из {total}):</b>",
+            "━━━━━━━━━━━━━━━━━━━━",
+        ]
+        for idx, lead in enumerate(page_slice, start=start + 1):
+            p = lead.place
+            r_str = f"{p.rating:.1f}⭐️" if p.rating is not None else "Без оценки"
+            rev_str = f"{p.user_ratings_total or 0} отз."
+            phone_info = parse_uz_phone(p.phone)
+            phone_str = f" • 📞 <code>{html.escape(phone_info.get('pretty') or p.phone or '')}</code>" if phone_info else ""
+            addr_short = html.escape((p.address or "").split(",")[0].strip())
+            lines.append(
+                f"\n<b>{idx}. {html.escape(p.name)}</b> — <b>{r_str}</b> ({rev_str})\n"
+                f"🎯 <i>Нужно +{lead.needed_5stars} оценок 5⭐️ до {lead.target_rating:.1f}⭐️ • Шанс: {lead.score}/100</i>\n"
+                f"📍 {addr_short}{phone_str}\n"
+                f"⚡️ Ссылка №1 (App): <code>{html.escape(lead.fast_app_url)}</code>\n"
+                f"⭐️ Ссылка №2 (5⭐️): <code>{html.escape(lead.direct_5star_url)}</code>"
+            )
+        lines.append(
+            "\n💡 <i>Тапните на любую ссылку для копирования в NFC Tools или нажмите кнопку 1️⃣–5️⃣ ниже для ИИ-питча и CRM!</i>"
+        )
+        return "\n".join(lines)
+
+    # Режим: Instagram (Мало подписчиков / слабый поток)
+    lines = [
+        f"🎯 <b>ТОП БИЗНЕСОВ: 📸 INSTAGRAM (Мало подписчиков / Слабый поток)</b>",
+        f"📍 Локация: <b>{html.escape(pack.location_query)}</b> • Собрано: <b>{total}</b> (проверено {pack.total_scanned} точек)",
+        f"📦 <b>Пачка #{page_idx + 1} из {total_pages} (Показаны {start + 1}–{end} из {total}):</b>",
+        "━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for idx, lead in enumerate(page_slice, start=start + 1):
+        p = lead.place
+        phone_info = parse_uz_phone(p.phone)
+        phone_str = f" • 📞 <code>{html.escape(phone_info.get('pretty') or p.phone or '')}</code>" if phone_info else ""
+        addr_short = html.escape((p.address or "").split(",")[0].strip())
+        if lead.ig_username:
+            flw_str = f"{lead.followers} подписчиков" if lead.followers is not None else "профиль активен"
+            lines.append(
+                f"\n<b>{idx}. {html.escape(p.name)}</b>\n"
+                f"📸 Инста: <b>@{html.escape(lead.ig_username)}</b> — 🔥 <b>{flw_str}</b> (Шанс: {lead.score}/100)\n"
+                f"📍 {addr_short}{phone_str}\n"
+                f"📲 NFC-ссылка: <code>{html.escape(lead.primary_nfc_url or '')}</code>\n"
+                f"⚡️ Deep Link: <code>{html.escape(lead.deep_link_url or '')}</code>"
+            )
+        else:
+            lines.append(
+                f"\n<b>{idx}. {html.escape(p.name)}</b>\n"
+                f"🎯 <i>Инстаграм не привязан к Картам — теряют трафик гостей! (Нажмите кнопку {idx - start}️⃣ ниже для точного пробива @ника)</i>\n"
+                f"📍 {addr_short}{phone_str}"
+            )
+    lines.append(
+        "\n💡 <i>Тапните на ссылку для копирования в NFC Tools или нажмите 1️⃣–5️⃣ для полной карточки и ИИ-скриптов!</i>"
+    )
+    return "\n".join(lines)
+
+
+def make_hc_pack_keyboard(
+    pack: HighChanceLocationPack,
+    mode: str,
+    page_idx: int,
+) -> InlineKeyboardMarkup:
+    """
+    Инлайн-клавиатура под пачкой из 5 лучших бизнесов:
+    - Стрелки ⬅️ Назад и Дальше (Ещё 5) ➡️
+    - Кнопки 1️⃣..5️⃣ для открытия детальной карточки конкретного бизнеса с ИИ-питчами
+    - Кнопка мгновенного переключения между Google Reviews и Instagram на этой же локации
+    """
+    items = pack.google_leads if mode == "google" else pack.insta_leads
+    total = len(items)
+    total_pages = max(1, (total + HC_PAGE_SIZE - 1) // HC_PAGE_SIZE)
+    page_idx = max(0, min(page_idx, total_pages - 1))
+    start = page_idx * HC_PAGE_SIZE
+    end = min(start + HC_PAGE_SIZE, total)
+
+    rows: List[List[InlineKeyboardButton]] = []
+
+    # Ряд 1: Стрелки навигации по пачкам из 5 бизнесов (⬅️ Назад | Стр. X/Y | Дальше (Ещё 5) ➡️)
+    nav_row: List[InlineKeyboardButton] = []
+    if page_idx > 0:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="⬅️ Назад (Предыдущие 5)",
+                callback_data=f"hc:page:{pack.pack_id}:{mode}:{page_idx - 1}",
+            )
+        )
+    nav_row.append(
+        InlineKeyboardButton(
+            text=f"📄 {page_idx + 1}/{total_pages} ({total} шт.)",
+            callback_data="hc:noop",
+        )
+    )
+    if page_idx + 1 < total_pages:
+        nav_row.append(
+            InlineKeyboardButton(
+                text="Дальше (Ещё 5) ➡️",
+                callback_data=f"hc:page:{pack.pack_id}:{mode}:{page_idx + 1}",
+            )
+        )
+    rows.append(nav_row)
+
+    # Ряд 2: Кнопки 1️⃣..5️⃣ для открытия полной карточки любого из 5 заведений на странице
+    num_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
+    item_btns: List[InlineKeyboardButton] = []
+    for local_i, abs_i in enumerate(range(start, end)):
+        item_btns.append(
+            InlineKeyboardButton(
+                text=f"{num_emojis[local_i]} #{abs_i + 1}",
+                callback_data=f"hc:item:{pack.pack_id}:{mode}:{abs_i}",
+            )
+        )
+    if item_btns:
+        rows.append(item_btns)
+
+    # Ряд 3: Мгновенное переключение Google Reviews <-> Instagram на этой же улице
+    other_mode = "insta" if mode == "google" else "google"
+    other_btn_text = (
+        f"📸 Инста (Мало подписчиков) на «{pack.location_query[:16]}»"
+        if other_mode == "insta"
+        else f"⭐️ Google (Плохие отзывы) на «{pack.location_query[:16]}»"
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=other_btn_text,
+                callback_data=f"hc:switch:{pack.pack_id}:{other_mode}",
+            )
+        ]
+    )
+
+    # Ряд 4: Другая локация / В меню парсера
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="📍 Другая локация",
+                callback_data=f"hc:mode:{mode}",
+            ),
+            InlineKeyboardButton(
+                text="🧭 В меню парсера",
+                callback_data="hc:menu",
+            ),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def execute_high_chance_scan(
+    target_message: Message,
+    location_query: str,
+    mode: str,
+    user_id: int = 0,
+    edit_existing: bool = False,
+):
+    """
+    Автономно собирает ВСЕ бизнесы на заданной локации, ранжирует их по выбранному критерию
+    (Google Reviews или Instagram с малым числом подписчиков) и выводит первую пачку из 5 ЛУЧШИХ!
+    """
+    loc_clean = location_query.strip()
+    if user_id:
+        user_last_hc_location[user_id] = loc_clean
+        user_hc_pending_mode.pop(user_id, None)
+
+    mode_label = (
+        "⭐️ Google Reviews (плохие отзывы и мало оценок)"
+        if mode == "google"
+        else "📸 Instagram (мало подписчиков и слабый поток)"
+    )
+    status_text = (
+        f"🛰 <b>Сканирую всю локацию «{html.escape(loc_clean)}»...</b>\n"
+        f"🧭 Режим: <b>{mode_label}</b>\n"
+        "<i>Собираю все заведения улицы, проверяю показатели и отбираю 5 ЛУЧШИХ...</i>"
+    )
+
+    if edit_existing:
+        status_msg = target_message
+        try:
+            await status_msg.edit_text(status_text, parse_mode=ParseMode.HTML)
+        except Exception:
+            status_msg = await target_message.answer(status_text, parse_mode=ParseMode.HTML)
+    else:
+        status_msg = await target_message.answer(status_text, parse_mode=ParseMode.HTML)
+
+    async with ChatActionSender.typing(bot=target_message.bot, chat_id=target_message.chat.id):
+        try:
+            loc_key = loc_clean.lower()
+            if loc_key in hc_places_cache and hc_places_cache[loc_key]:
+                places = hc_places_cache[loc_key]
+            else:
+                places = await collect_all_location_places(loc_clean)
+                if places:
+                    hc_places_cache[loc_key] = places
+                    if len(hc_places_cache) > 100:
+                        oldest_k = next(iter(hc_places_cache))
+                        del hc_places_cache[oldest_k]
+
+            if not places:
+                await status_msg.edit_text(
+                    f"🔍 <b>На локации «{html.escape(loc_clean)}» заведений не найдено.</b>\n\n"
+                    "Попробуйте ввести название улицы иначе (например: <code>Тараса Шевченко</code>, <code>Паркентская</code>, <code>Шота Руставели</code>):",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=make_hc_location_keyboard(mode),
+                )
+                return
+
+            google_leads = rank_google_reviews_leads(places)
+            insta_leads: List[HighChanceInstaLead] = []
+            if mode == "insta":
+                insta_leads = await rank_instagram_low_followers_leads(places)
+
+            pack_id = uuid.uuid4().hex[:8]
+            pack = HighChanceLocationPack(
+                pack_id=pack_id,
+                location_query=loc_clean,
+                mode=mode,
+                total_scanned=len(places),
+                google_leads=google_leads,
+                insta_leads=insta_leads,
+            )
+            hc_pack_cache[pack_id] = pack
+            if len(hc_pack_cache) > 300:
+                oldest_pack = next(iter(hc_pack_cache))
+                del hc_pack_cache[oldest_pack]
+
+            page_text = format_hc_pack_page(pack, mode=mode, page_idx=0)
+            page_kb = make_hc_pack_keyboard(pack, mode=mode, page_idx=0)
+            await status_msg.edit_text(
+                page_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=page_kb,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.exception("Ошибка Парсера высоких шансов продаж на '%s': %s", loc_clean, e)
+            await status_msg.edit_text(
+                f"⚠️ <b>Ошибка при сканировании локации «{html.escape(loc_clean)}»:</b>\n<code>{html.escape(str(e))}</code>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=make_hc_main_inline_keyboard(loc_clean),
+            )
+
+
+@router.message(Command("parser"))
+@router.message(F.text == BTN_HIGH_CHANCE)
+async def handle_high_chance_menu_btn(message: Message):
+    """Открывает Парсер высоких шансов продаж с двумя инлайн-кнопками (Google Reviews / Instagram)."""
+    user_id = message.from_user.id if message.from_user else 0
+    user_hc_pending_mode[user_id] = "choose"
+    last_loc = user_last_hc_location.get(user_id)
+    await message.answer(
+        format_hc_menu_text(last_loc),
+        parse_mode=ParseMode.HTML,
+        reply_markup=make_hc_main_inline_keyboard(last_loc),
+    )
+
+
+@router.callback_query(F.data.startswith("hc:"))
+async def handle_high_chance_callbacks(callback: CallbackQuery):
+    """
+    Обработчик всех инлайн-кнопок Парсера высоких шансов продаж:
+    - hc:menu — главное меню с 2 инлайн-кнопками (⭐️ Google Reviews | 📸 Instagram)
+    - hc:mode:{google|insta} — выбор режима и запрос локации
+    - hc:loc:{mode}:{loc_key} — запуск по пресету популярной улицы
+    - hc:run_last:{mode} — запуск по последней введённой пользователем локации
+    - hc:page:{pack_id}:{mode}:{page_idx} — перелистывание пачек по 5 бизнесов (⬅️ Назад / Дальше (Ещё 5) ➡️)
+    - hc:switch:{pack_id}:{mode} — переключение Google Reviews <-> Instagram на той же локации
+    - hc:item:{pack_id}:{mode}:{abs_idx} — открытие детальной карточки выбранного бизнеса (1️⃣..5️⃣)
+    """
+    parts = callback.data.split(":")
+    action = parts[1] if len(parts) > 1 else "menu"
+    user_id = callback.from_user.id if callback.from_user else 0
+
+    if action == "noop":
+        await callback.answer("Используйте стрелки ⬅️ Назад и Дальше (Ещё 5) ➡️ для листания пачек")
+        return
+
+    if action == "menu":
+        user_hc_pending_mode[user_id] = "choose"
+        last_loc = user_last_hc_location.get(user_id)
+        try:
+            await callback.message.edit_text(
+                format_hc_menu_text(last_loc),
+                parse_mode=ParseMode.HTML,
+                reply_markup=make_hc_main_inline_keyboard(last_loc),
+            )
+        except Exception:
+            await callback.message.answer(
+                format_hc_menu_text(last_loc),
+                parse_mode=ParseMode.HTML,
+                reply_markup=make_hc_main_inline_keyboard(last_loc),
+            )
+        await callback.answer("🎯 Парсер высоких шансов продаж")
+        return
+
+    if action == "mode" and len(parts) >= 3:
+        mode = parts[2]
+        user_hc_pending_mode[user_id] = mode
+        last_loc = user_last_hc_location.get(user_id)
+        if mode == "google":
+            prompt_text = (
+                "⭐️ <b>Режим парсера: Google Reviews (Плохие отзывы / мало оценок)</b>\n\n"
+                "📍 <b>Напишите название улицы или локации в чат</b> (например: <code>Тараса Шевченко</code>, "
+                "<code>Паркентская</code>, <code>Шота Руставели</code>, <code>Ойбек</code>, <code>Чиланзар</code>)\n"
+                "— или выберите готовую локацию кнопкой ниже:"
+            )
+        else:
+            prompt_text = (
+                "📸 <b>Режим парсера: Instagram (Мало подписчиков / слабый поток)</b>\n\n"
+                "📍 <b>Напишите название улицы или локации в чат</b> (например: <code>Тараса Шевченко</code>, "
+                "<code>Паркентская</code>, <code>Шота Руставели</code>, <code>Ойбек</code>, <code>Чиланзар</code>)\n"
+                "— или выберите готовую локацию кнопкой ниже:"
+            )
+        try:
+            await callback.message.edit_text(
+                prompt_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=make_hc_location_keyboard(mode, last_loc),
+            )
+        except Exception:
+            await callback.message.answer(
+                prompt_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=make_hc_location_keyboard(mode, last_loc),
+            )
+        await callback.answer("📍 Укажите локацию или выберите улицу")
+        return
+
+    if action == "loc" and len(parts) >= 4:
+        mode = parts[2]
+        loc_key = parts[3]
+        loc_title = POPULAR_LOCATIONS.get(loc_key, loc_key)
+        await callback.answer(f"🚀 Собираю бизнесы на «{loc_title}»...")
+        await execute_high_chance_scan(
+            callback.message,
+            location_query=loc_title,
+            mode=mode,
+            user_id=user_id,
+            edit_existing=True,
+        )
+        return
+
+    if action == "run_last" and len(parts) >= 3:
+        mode = parts[2]
+        last_loc = user_last_hc_location.get(user_id)
+        if not last_loc:
+            user_hc_pending_mode[user_id] = mode
+            await callback.answer("Сначала напишите улицу или выберите из списка!", show_alert=True)
+            return
+        await callback.answer(f"🚀 Сканирую «{last_loc}»...")
+        await execute_high_chance_scan(
+            callback.message,
+            location_query=last_loc,
+            mode=mode,
+            user_id=user_id,
+            edit_existing=True,
+        )
+        return
+
+    if action == "page" and len(parts) >= 5:
+        pack_id = parts[2]
+        mode = parts[3]
+        try:
+            page_idx = int(parts[4])
+        except ValueError:
+            page_idx = 0
+        pack = hc_pack_cache.get(pack_id)
+        if not pack:
+            await callback.answer("⚠️ Сессия устарела. Запустите парсер локации заново.", show_alert=True)
+            return
+        page_text = format_hc_pack_page(pack, mode=mode, page_idx=page_idx)
+        page_kb = make_hc_pack_keyboard(pack, mode=mode, page_idx=page_idx)
+        try:
+            await callback.message.edit_text(
+                page_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=page_kb,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+        await callback.answer(f"📦 Пачка #{page_idx + 1}")
+        return
+
+    if action == "switch" and len(parts) >= 4:
+        pack_id = parts[2]
+        target_mode = parts[3]
+        pack = hc_pack_cache.get(pack_id)
+        if not pack:
+            await callback.answer("⚠️ Сессия устарела. Запустите парсер локации заново.", show_alert=True)
+            return
+        if target_mode == "insta" and not pack.insta_leads:
+            await callback.answer("📸 Проверяю подписчиков Instagram по всем точкам улицы...")
+            try:
+                await callback.message.edit_text(
+                    f"📸 <b>Проверяю Instagram-аккаунты и подписчиков на «{html.escape(pack.location_query)}»...</b>\n"
+                    "<i>Отбираю бизнесы с самым малым числом подписчиков и слабым потоком...</i>",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception:
+                pass
+            loc_key = pack.location_query.lower()
+            places = hc_places_cache.get(loc_key) or await collect_all_location_places(pack.location_query)
+            pack.insta_leads = await rank_instagram_low_followers_leads(places)
+        pack.mode = target_mode
+        page_text = format_hc_pack_page(pack, mode=target_mode, page_idx=0)
+        page_kb = make_hc_pack_keyboard(pack, mode=target_mode, page_idx=0)
+        try:
+            await callback.message.edit_text(
+                page_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=page_kb,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
+        await callback.answer("🔄 Режим переключён!")
+        return
+
+    if action == "item" and len(parts) >= 5:
+        pack_id = parts[2]
+        mode = parts[3]
+        try:
+            abs_idx = int(parts[4])
+        except ValueError:
+            abs_idx = 0
+        pack = hc_pack_cache.get(pack_id)
+        if not pack:
+            await callback.answer("⚠️ Сессия устарела. Запустите парсер заново.", show_alert=True)
+            return
+
+        if mode == "google":
+            if abs_idx < 0 or abs_idx >= len(pack.google_leads):
+                await callback.answer("Заведение не найдено", show_alert=True)
+                return
+            g_lead = pack.google_leads[abs_idx]
+            card_text = format_place_card(
+                g_lead.place,
+                score=g_lead.score,
+                tier_badge=g_lead.tier_badge,
+                why_hot=g_lead.pain_text,
+            )
+            kb = make_place_keyboard(
+                g_lead.place,
+                score=g_lead.score,
+                tier_badge=g_lead.tier_badge,
+                why_hot=g_lead.pain_text,
+            )
+            await callback.message.reply(
+                card_text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+            await callback.answer(f"⭐️ Карточка «{g_lead.place.name[:20]}»")
+            return
+        else:
+            if abs_idx < 0 or abs_idx >= len(pack.insta_leads):
+                await callback.answer("Заведение не найдено", show_alert=True)
+                return
+            ig_lead = pack.insta_leads[abs_idx]
+            if ig_lead.ig_username:
+                card_data = build_instagram_card_data(
+                    raw_input=ig_lead.ig_username,
+                    profile_title=ig_lead.ig_title,
+                    followers_count=ig_lead.followers,
+                )
+                card_html = format_instagram_card(card_data, searched_query=ig_lead.place.name)
+                kb = make_instagram_card_keyboard(card_data.clean_username)
+                await callback.message.reply(
+                    card_html,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb,
+                    disable_web_page_preview=True,
+                )
+                await callback.answer(f"📸 @{ig_lead.ig_username}")
+            else:
+                await callback.answer(f"🔎 Ищу точный Instagram для «{ig_lead.place.name[:18]}»...")
+                await process_business_instagram_search(callback.message, ig_lead.place.name)
+            return
 
 
 @router.message(F.text == BTN_MODE_GOOGLE)
@@ -1023,10 +1651,11 @@ async def handle_mode_google_btn(message: Message):
     """Переключение в режим Google Reviews NFC."""
     if message.from_user:
         user_modes[message.from_user.id] = "google"
+        user_hc_pending_mode.pop(message.from_user.id, None)
 
     text = (
         "⭐️ <b>Включён режим: Google Reviews NFC</b>\n\n"
-        "• Нажмите <b>«🎯 Автопоиск ТОП-лидов»</b> или <b>«🔥 Быстрый рейд»</b> внизу экрана\n"
+        "• Нажмите <b>«🎯 Парсер высоких шансов продаж»</b> или <b>«🎯 Автопоиск ТОП-лидов»</b> внизу экрана\n"
         "• Или отправьте название заведения и улицу (<i>Жигули Бар Ташкент</i>)\n"
         "• Или ссылку из Google Maps (<code>https://maps.app.goo.gl/...</code>)"
     )
@@ -1043,6 +1672,7 @@ async def handle_mode_insta_btn(message: Message):
     """Переключение в режим Instagram NFC."""
     if message.from_user:
         user_modes[message.from_user.id] = "insta"
+        user_hc_pending_mode.pop(message.from_user.id, None)
 
     await message.answer(
         format_insta_mode_prompt(),
@@ -1930,6 +2560,44 @@ async def handle_text_message(message: Message):
     if not url_match and is_instagram_input(text, mode_hint=current_mode):
         await process_instagram_request(message, text)
         return
+
+    # 3. Если пользователь открыл «🎯 Парсер высоких шансов продаж» и написал локацию в чат
+    pending_hc = user_hc_pending_mode.get(user_id)
+    if not url_match and pending_hc:
+        if pending_hc in ("google", "insta"):
+            await execute_high_chance_scan(
+                message,
+                location_query=text,
+                mode=pending_hc,
+                user_id=user_id,
+                edit_existing=False,
+            )
+            return
+        elif pending_hc == "choose":
+            user_last_hc_location[user_id] = text
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=f"⭐️ Google Reviews на «{text[:22]}»",
+                            callback_data="hc:run_last:google",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text=f"📸 Instagram (Мало подп.) на «{text[:20]}»",
+                            callback_data="hc:run_last:insta",
+                        )
+                    ],
+                ]
+            )
+            await message.reply(
+                f"📍 <b>Локация принята: «{html.escape(text)}»</b>\n\n"
+                "👇 <b>Выберите, каких клиентов собрать со всей этой локации (пачками по 5 ЛУЧШИХ):</b>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+            )
+            return
 
     async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
         try:
