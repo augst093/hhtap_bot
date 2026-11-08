@@ -40,8 +40,10 @@ from services.instagram_service import (
     InstagramCardData,
     InstagramParseError,
     build_instagram_card_data,
+    extract_insta_search_query,
     format_instagram_card,
     is_instagram_input,
+    resolve_business_instagram,
 )
 from services.lead_hunter import (
     CRM_STATUSES,
@@ -233,22 +235,42 @@ def make_start_mode_inline_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def make_instagram_card_keyboard(clean_username: str) -> InlineKeyboardMarkup:
+def make_instagram_card_keyboard(
+    clean_username: str,
+    alternatives: Optional[List[str]] = None,
+) -> InlineKeyboardMarkup:
     """
     Inline-меню под результатом Instagram NFC-карты:
     Row 1: [🔍 Проверить аккаунт] (URL -> https://instagram.com/{clean_username})
+    Row 1b (опционально): кнопки быстрого переключения на альтернативные найденные профили
     Row 2: [🎯 Питч для клиента (Текст)] | [🗣 Скрипт для живого разговора]
     Row 3: [💥 Комбо-оффер (Google + Insta)]
     Row 4: [⬅️ В главное меню]
     """
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="🔍 Проверить аккаунт",
-                    url=f"https://instagram.com/{clean_username}",
+    rows: List[List[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text=f"🔍 Проверить аккаунт (@{clean_username})",
+                url=f"https://instagram.com/{clean_username}",
+            )
+        ]
+    ]
+
+    if alternatives:
+        alt_btns = []
+        for alt in alternatives[:2]:
+            if alt and alt.lower() != clean_username.lower() and len(alt) <= 30:
+                alt_btns.append(
+                    InlineKeyboardButton(
+                        text=f"🔄 @{alt}",
+                        callback_data=f"ig:card:{alt}",
+                    )
                 )
-            ],
+        if alt_btns:
+            rows.append(alt_btns)
+
+    rows.extend(
+        [
             [
                 InlineKeyboardButton(
                     text="🎯 Питч для клиента (Текст)",
@@ -273,6 +295,7 @@ def make_instagram_card_keyboard(clean_username: str) -> InlineKeyboardMarkup:
             ],
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def make_instagram_ai_response_keyboard(clean_username: str, action: str) -> InlineKeyboardMarkup:
@@ -695,7 +718,9 @@ def make_contacts_crm_drawer_keyboard(short_id: str) -> InlineKeyboardMarkup:
             )
         rows.append(social_row)
 
-        # Если у точки в Google Maps уже привязан Instagram — даём кнопку 1-клик для генерации Instagram NFC-карты!
+        # Если у точки в Google Maps уже привязан Instagram — даём кнопку 1-клик для генерации Instagram NFC-карты,
+        # а если нет — кнопку мгновенного автопоиска Instagram NFC по названию точки!
+        ig_btn_added = False
         if cached.website and "instagram.com" in cached.website.lower():
             try:
                 clean_ig = build_instagram_card_data(cached.website).clean_username
@@ -708,8 +733,18 @@ def make_contacts_crm_drawer_keyboard(short_id: str) -> InlineKeyboardMarkup:
                             )
                         ]
                     )
+                    ig_btn_added = True
             except Exception:
                 pass
+        if not ig_btn_added:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text="📸 Автопоиск Instagram NFC в 1 клик",
+                        callback_data=f"ig:find:{short_id}",
+                    )
+                ]
+            )
 
         # Кнопки статусов Мини-CRM (с галочкой на текущем статусе)
         crm_entry = lead_hunter_service.get_crm_entry(cached.place_id)
@@ -948,17 +983,17 @@ def format_main_welcome_text() -> str:
         f"{ai_desc}\n\n"
         "🧭 <b>ДВА РАБОЧИХ МОДУЛЯ БОТА:</b>\n"
         "1️⃣ <b>⭐️ Google Reviews NFC:</b> автопоиск ТОП-5 заведений по улицам Ташкента, прямые 5⭐️ ссылки для NFC Tools, контакты и ИИ-питчи.\n"
-        "2️⃣ <b>📸 Instagram NFC:</b> генерация ссылок для NFC-карт под любой Instagram-аккаунт (<code>@username</code> или ссылка) + скрипты продаж и комбо-оффер.\n\n"
-        "💡 <i>Бот также поддерживает автоопределение: просто отправьте <code>@ник</code> или ссылку <code>instagram.com/...</code> либо название заведения!</i>"
+        "2️⃣ <b>📸 Instagram NFC:</b> мгновенный поиск Instagram любого бизнеса по названию с припиской <code>инста</code>/<code>insta</code> (например: <code>Kamolon Osh insta</code> или <code>Камолон Ош инста</code>), либо по <code>@username</code> / ссылке!\n\n"
+        "💡 <i>Оба парсера работают одновременно: пишите название точки для Google Карт или добавьте в конце <code>инста</code> / <code>insta</code>, чтобы бот сам нашёл её Instagram и выдал NFC-ссылки!</i>"
     )
 
 
 def format_insta_mode_prompt() -> str:
     return (
         "📸 <b>Режим: Instagram NFC</b>\n\n"
-        "Отправьте Instagram-аккаунт клиента в любом удобном формате:\n"
-        "• Чистый никнейм: <code>phoenix_math_school</code>\n"
-        "• Ник с собачкой: <code>@phoenix_math_school</code>\n"
+        "Отправьте название бизнеса с припиской <code>insta</code> / <code>инста</code> или готовый никнейм:\n"
+        "• По названию бизнеса (бот сам найдёт ник!): <code>Kamolon Osh insta</code> или <code>Камолон Ош инста</code>\n"
+        "• Чистый никнейм: <code>phoenix_math_school</code> или <code>@phoenix_math_school</code>\n"
         "• Полную ссылку: <code>https://www.instagram.com/phoenix_math_school/</code>\n\n"
         "⚡️ Бот мгновенно выдаст <b>2 готовые ссылки для записи в NFC Tools</b> "
         "(основную с <code>igsh</code> для iOS/Android и прямой Deep Link) + кнопки генерации ИИ-питчей и Комбо-оффера!"
@@ -1097,6 +1132,16 @@ async def handle_instagram_callbacks(callback: CallbackQuery):
             await callback.answer(f"Ошибка: {e}", show_alert=True)
         return
 
+    if parts[1] == "find" and len(parts) >= 3:
+        short_id = parts[2]
+        cached = place_cache.get(short_id)
+        if not cached:
+            await callback.answer("⚠️ Карточка устарела. Напишите название с припиской 'инста'.", show_alert=True)
+            return
+        await callback.answer(f"🔎 Ищу Instagram для «{cached.name}»...")
+        await process_business_instagram_search(callback.message, cached.name)
+        return
+
     is_regen = False
     if parts[1] == "r" and len(parts) >= 4:
         is_regen = True
@@ -1158,6 +1203,61 @@ async def process_instagram_request(message: Message, raw_text: str):
             f"⚠️ <b>Ошибка разбора аккаунта Instagram</b>\n\n{e.message}",
             parse_mode=ParseMode.HTML,
         )
+
+
+async def process_business_instagram_search(message: Message, biz_query: str):
+    """
+    Мгновенно ищет официальный Instagram-аккаунт любого бизнеса по его названию
+    (например: 'Kamolon Osh insta' -> biz_query='Kamolon Osh' -> @kamolonosh)
+    и сразу отправляет готовую карточку Instagram NFC со ссылками!
+    """
+    logger.info("Автопоиск Instagram по названию бизнеса: '%s'", biz_query)
+    async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
+        try:
+            profiles = await resolve_business_instagram(biz_query)
+            if profiles:
+                top = profiles[0]
+                alts = [p["username"] for p in profiles[1:3] if p.get("username")]
+                card_data = build_instagram_card_data(
+                    raw_input=top["username"],
+                    profile_title=top.get("title"),
+                    followers_count=top.get("followers"),
+                    alternative_usernames=alts,
+                )
+                card_html = format_instagram_card(card_data, searched_query=biz_query)
+                kb = make_instagram_card_keyboard(card_data.clean_username, alternatives=alts)
+                await message.reply(
+                    card_html,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=kb,
+                    disable_web_page_preview=True,
+                )
+                return
+
+            # Если точный профиль автоматически не подтверждён — даём кнопку быстрого поиска в Google
+            _, search_url = build_insta_search_url(biz_query, None)
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text=f"🔎 Открыть Instagram «{biz_query[:22]}» в Google",
+                            url=search_url,
+                        )
+                    ]
+                ]
+            )
+            await message.reply(
+                f"🔍 <b>Точный Instagram-аккаунт для «{html.escape(biz_query)}» не найден автоматически</b>\n\n"
+                "Нажмите кнопку ниже, чтобы открыть профиль в 1 клик, или отправьте точный <code>@username</code>:",
+                parse_mode=ParseMode.HTML,
+                reply_markup=kb,
+            )
+        except Exception as e:
+            logger.exception("Ошибка при автопоиске Instagram для '%s': %s", biz_query, e)
+            await message.reply(
+                f"⚠️ <b>Ошибка при поиске Instagram:</b>\n<code>{html.escape(str(e))}</code>",
+                parse_mode=ParseMode.HTML,
+            )
 
 
 @router.message(Command("hunt"))
@@ -1817,7 +1917,16 @@ async def handle_text_message(message: Message):
     current_mode = user_modes.get(user_id, "google")
     url_match = MAPS_URL_REGEX.search(text)
 
-    # Если это не ссылка Google Maps и запрос распознан как Instagram-аккаунт / ссылка Instagram
+    # 1. Если пользователь написал название бизнеса с припиской 'insta' / 'инста'
+    #    (например: 'Kamolon Osh insta', 'Камолон Ош инста', 'Roni инста') —
+    #    мгновенно находим Instagram этого бизнеса и выдаём готовую Instagram NFC карту!
+    if not url_match:
+        insta_biz_query = extract_insta_search_query(text)
+        if insta_biz_query:
+            await process_business_instagram_search(message, insta_biz_query)
+            return
+
+    # 2. Если это прямой Instagram-аккаунт (@username, ссылка instagram.com или одиночный ник)
     if not url_match and is_instagram_input(text, mode_hint=current_mode):
         await process_instagram_request(message, text)
         return
