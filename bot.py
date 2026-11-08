@@ -404,21 +404,35 @@ def format_contacts_and_crm_block(place: PlaceInfo) -> str:
 
 def format_nfc_links_block(place: PlaceInfo) -> str:
     """
-    Формирует блок из ОБЕИХ рабочих ссылок для NFC Tools (обе всегда присутствуют в карточке):
+    Формирует блок из ОБЕИХ рабочих ссылок для NFC Tools (обе всегда присутствуют в карточке)
+    + автоматически добавляет готовую Instagram NFC-ссылку, если у точки в Гугле указан Instagram:
     1) ⚡️ Ссылка №1 — Быстрые отзывы в приложении Google Maps (0.5 сек, флаг !9m1!1b1):
        https://www.google.com/maps/place//data=!4m4!3m3!1s0x...:0x...!9m1!1b1
     2) ⭐️ Ссылка №2 — Прямое окно оценки 5 звёзд (Универсальная: работает везде, с приложением и без):
        https://search.google.com/local/writereview?placeid=ChIJ...
+    3) 📸 Ссылка №3 (если найден Instagram точки) — Готовая ссылка для записи Instagram NFC-карты!
     """
     fast_reviews_url = build_fast_reviews_app_url(place.place_id, place.google_maps_url)
     direct_5star_url = place.review_url or build_review_url(place.place_id)
 
-    return (
+    base_block = (
         f"⚡️ <b>Ссылка №1 — Быстрые отзывы (Google Maps App):</b>\n"
         f"<code>{html.escape(fast_reviews_url)}</code>\n\n"
         f"⭐️ <b>Ссылка №2 — Прямое окно 5 звёзд (Универсальная • Любое устройство):</b>\n"
         f"<code>{html.escape(direct_5star_url)}</code>"
     )
+
+    if place.website and ("instagram.com" in place.website.lower() or "instagr.am" in place.website.lower()):
+        try:
+            ig_card = build_instagram_card_data(place.website)
+            base_block += (
+                f"\n\n📸 <b>Ссылка №3 — Готовая Instagram NFC (@{html.escape(ig_card.clean_username)}):</b>\n"
+                f"<code>{html.escape(ig_card.primary_nfc_url)}</code>"
+            )
+        except Exception:
+            pass
+
+    return base_block
 
 
 def format_place_card(place: PlaceInfo) -> str:
@@ -603,24 +617,37 @@ def make_place_keyboard(place: PlaceInfo) -> InlineKeyboardMarkup:
     short_id = cache_place(place)
     crm_entry = lead_hunter_service.get_crm_entry(place.place_id)
     crm_btn_text = "✅ Контакты и CRM" if crm_entry else "📞 Контакты и CRM"
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="✉️ Написать",
-                    callback_data=f"ai:{short_id}:msg_menu",
-                ),
-                InlineKeyboardButton(
-                    text=crm_btn_text,
-                    callback_data=f"crm:{short_id}:menu",
-                ),
-                InlineKeyboardButton(
-                    text="🔗 5⭐️",
-                    url=place.review_url or build_review_url(place.place_id),
-                ),
-            ],
+    rows: List[List[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="✉️ Написать",
+                callback_data=f"ai:{short_id}:msg_menu",
+            ),
+            InlineKeyboardButton(
+                text=crm_btn_text,
+                callback_data=f"crm:{short_id}:menu",
+            ),
+            InlineKeyboardButton(
+                text="🔗 5⭐️",
+                url=place.review_url or build_review_url(place.place_id),
+            ),
         ]
-    )
+    ]
+    if place.website and ("instagram.com" in place.website.lower() or "instagr.am" in place.website.lower()):
+        try:
+            clean_ig = build_instagram_card_data(place.website).clean_username
+            if clean_ig and len(clean_ig) <= 30:
+                rows.append(
+                    [
+                        InlineKeyboardButton(
+                            text=f"📸 Открыть карточку Instagram NFC (@{clean_ig})",
+                            callback_data=f"ig:card:{clean_ig}",
+                        )
+                    ]
+                )
+        except Exception:
+            pass
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def make_contacts_crm_drawer_keyboard(short_id: str) -> InlineKeyboardMarkup:
@@ -1794,9 +1821,6 @@ async def handle_text_message(message: Message):
     if not url_match and is_instagram_input(text, mode_hint=current_mode):
         await process_instagram_request(message, text)
         return
-
-    # Если пользователь ввёл обычный запрос для Google Карт — автоматически держим режим Google активным
-    user_modes[user_id] = "google"
 
     async with ChatActionSender.typing(bot=message.bot, chat_id=message.chat.id):
         try:

@@ -26,15 +26,17 @@ RESERVED_IG_PATHS = {
     "developer",
     "challenge",
     "ar",
-    " session",
+    "session",
+    "_u",
+    "share",
 }
 
 # Валидный username в Instagram: от 1 до 30 символов (буквы латиницы, цифры, точка, нижнее подчеркивание)
 IG_USERNAME_REGEX = re.compile(r"^[A-Za-z0-9._]{1,30}$")
 
-# Регулярное выражение для извлечения username из любой ссылки instagram.com / instagr.am
+# Регулярное выражение для извлечения username из любой ссылки instagram.com / instagr.am (включая /_u/ и /stories/)
 IG_URL_REGEX = re.compile(
-    r"(?:https?://)?(?:www\.)?(?:instagram\.com|instagr\.am)/([A-Za-z0-9._]{1,30})(?:[/?#]|$)",
+    r"(?:https?://)?(?:www\.|m\.)?(?:instagram\.com|instagr\.am)/(?:_u/|stories/)?([A-Za-z0-9._]{1,30})(?:[/?#]|$)",
     re.IGNORECASE,
 )
 
@@ -109,10 +111,14 @@ def parse_instagram_username(raw_input: str) -> str:
             )
         return valid
 
-    # 2. Если пользователь прислал @username или чистый username
-    # Отрезаем случайные query-параметры и слеши, если скинули 'phoenix_math_school/?igsh=...'
-    token = text.split()[0].strip()
-    token = token.split("?")[0].split("#")[0].strip().lstrip("@").strip("/")
+    # 2. Если пользователь написал префикс 'инста nick' / 'insta @nick' / 'ig nick'
+    prefix_match = re.match(r"^(?:инста|инстаграм|insta|instagram|ig)\s+(@?[A-Za-z0-9._]{1,30})$", text, re.IGNORECASE)
+    if prefix_match:
+        token = prefix_match.group(1).lstrip("@").strip("/")
+    else:
+        # 3. Если пользователь прислал @username или чистый username
+        token = text.split()[0].strip()
+        token = token.split("?")[0].split("#")[0].strip().lstrip("@").strip("/")
 
     valid = validate_ig_username(token)
     if not valid:
@@ -147,8 +153,14 @@ def is_instagram_input(text: str, mode_hint: str = "google") -> bool:
     if "instagram.com/" in low or "instagr.am/" in low:
         return True
 
-    # 2. Никнейм с собачкой @username
-    if stripped.startswith("@") and len(stripped) > 1 and " " not in stripped:
+    # 2. Никнейм с собачкой @username (включая случайные пробелы по краям)
+    if stripped.startswith("@") and len(stripped) > 1:
+        first_tok = stripped.split()[0]
+        if len( stripped.split() ) == 1 and validate_ig_username(first_tok) is not None:
+            return True
+
+    # 2b. Явный префикс 'инста username' / 'insta username' / 'ig username'
+    if re.match(r"^(?:инста|инстаграм|insta|instagram|ig)\s+@?[A-Za-z0-9._]{1,30}$", stripped, re.IGNORECASE):
         return True
 
     # 3. Если в запросе есть пробелы, кириллица или другая http-ссылка — это 100% поиск заведения в Google Картах!
