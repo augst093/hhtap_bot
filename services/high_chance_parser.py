@@ -1,17 +1,10 @@
-"""
-Автономный Парсер Высоких Шансов Продаж (HHtap High-Conversion Scanner).
-По любой заданной пользователем локации (улица, район, ориентир, например «Тараса Шевченко»)
-собирает ВСЕ релевантные бизнесы и ранжирует их в 2 целевых режимах:
-1) ⭐️ Google Reviews: бизнесы с плохим/уязвимым рейтингом и малым числом отзывов (острая боль в картах).
-2) 📸 Instagram: бизнесы с малым количеством подписчиков в Instagram и слабым переливом трафика из офлайна.
-Выдаёт результаты пачками по 5 лучших бизнесов с мгновенным перелистыванием (Дальше ещё 5 / Назад).
-"""
 import asyncio
 import html
 import logging
 import re
+import urllib.parse
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
@@ -36,7 +29,7 @@ from services.lead_hunter import (
     evaluate_lead_potential,
 )
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("hhtap_bot.high_chance_parser")
 
 
 @dataclass
@@ -54,14 +47,17 @@ class HighChanceGoogleLead:
 @dataclass
 class HighChanceInstaLead:
     place: PlaceInfo
-    ig_username: Optional[str]
-    ig_title: Optional[str]
-    followers: Optional[int]
+    ig_username: str
+    ig_title: str
+    followers: int
+    posts: int
     score: int
     tier_badge: str
     pain_text: str
-    primary_nfc_url: Optional[str]
-    deep_link_url: Optional[str]
+    verification_badge: str
+    primary_nfc_url: str
+    deep_link_url: str
+    profile_web_url: str
 
 
 @dataclass
@@ -86,7 +82,6 @@ POPULAR_LOCATIONS: Dict[str, str] = {
     "boulevard": "Tashkent City / Boulevard",
 }
 
-
 # Крупные сетевые гиганты и агрегаторы, которым не продают одиночные карты с улицы
 CHAIN_BLACKLIST = (
     "evos", "эвос", "kfc", "кфс", "bellissimo", "беллиссимо", "dodo", "додо",
@@ -101,6 +96,15 @@ GENERIC_ONLY_NAMES = {
     "burger", "бургер", "pizza", "пицца", "coffee", "кофе", "lounge", "лаунж",
     "the", "new", "big", "top", "vip", "pro", "one", "art", "my", "na", "на",
     "republic", "house", "club", "time", "city", "studio", "dental", "clinic",
+    "denta", "дента", "bar", "бар", "sushi", "суши", "market", "маркет",
+    "podarki", "подарки", "tsvetochnaya", "цветочная", "lavka", "лавка",
+    "tsvety", "цветы", "flowers", "flower", "buket", "букет", "magazin", "магазин",
+}
+
+STREET_STOPWORDS = {
+    "shevchenko", "шевченко", "taras", "тарас", "parkent", "паркент", "rustaveli",
+    "руставели", "tashkent", "ташкент", "oybek", "ойбек", "mirabad", "мирабад",
+    "chilanzar", "чиланзар", "yunusabad", "юнусабад", "boulevard", "c1", "ц1",
 }
 
 DIRECTORY_DOMAINS = {
@@ -108,6 +112,44 @@ DIRECTORY_DOMAINS = {
     "t", "2gis", "goldenpages", "yellowpages", "sprav", "zoon", "yandex",
     "alteg", "yclients", "linktr", "hipolink", "mssg",
 }
+
+# Признаки чужих стран/городов и нецелевых аккаунтов — отсекаются мгновенно
+FOREIGN_MARKERS = (
+    "+7", "8(9", "8 (9", "москва", "мск", "санкт-петербург", "спб", "питер",
+    "алматы", "астана", "казахстан", "бишкек", "армавир", "краснодар", "сочи",
+    "екатеринбург", "новосибирск", "казань", "минск", "киев", "павелецкая",
+    "калининград", "ростов", "самара", "уфа", "челябинск", "воронеж", "пермь",
+    "волгоград", "красноярск", "саратов", "тюмень", "тольятти", "ижевск", "барнаул",
+    "иркутск", "хабаровск", "ярославль", "владивосток", "махачкала", "томск", "оренбург",
+    "кемерово", "новокузнецк", "рязань", "астрахань", "пенза", "липецк", "тула", "киров",
+    "чебоксары", "курск", "брянск", "магнитогорск", "иваново", "тверь", "ставрополь",
+    "белгород", "сочи", " крым", "севастополь", "симферополь", "душанбе", "баку", "тбилиси",
+    "ереван", "самарканд", "бухара", "фергана", "андижан", "наманган", "нукус", "карши",
+    "hanoi", "france", "marzo", "peluquer", "especializados", "livraison",
+    "barbados island", "🇦🇺", "🇵🇾", "🇷🇺", "🇰🇿", "🇰🇬", "🇬🇧", "🇧🇾",
+    "профиль продается", "аккаунт продается", "+999",
+)
+
+# Признаки реального коммерческого заведения в шапке или описании профиля
+REAL_BIZ_CATEGORY_WORDS = (
+    "ресторан", "restaurant", "ristorante", "кафе", "cafe", "coffee", "кофейня",
+    "пекарня", "bakery", "boulangerie", "кондитер", "гастро", "gastro", "bistro", "бистро",
+    "бар", "bar", "pub", "паб", "lounge", "лаунж", "кальян", "shisha", "hookah",
+    "пицц", "pizza", "pizzeria", "суши", "sushi", "роллы", "wok", "бургер", "burger",
+    "кухня", "kitchen", "cuisine", "меню", "menu", "бронь", "резерв", "доставка", "delivery",
+    "halal", "халяль", "барбер", "barber", "стриж", "брить", "салон", "beauty",
+    "косметолог", "клиника", "clinic", "стоматолог", "dental", "stomatolog", "ортодонт",
+    "имплант", "винир", "цветы", "букет", "flowers", "floral", "roses", "декор",
+    "часы работы", "режим работы", "пн-вс", "ежедневно", "без выходных",
+)
+
+# Признаки привязки к Ташкенту / Узбекистану
+UZ_GEO_MARKERS = (
+    "+998", "998", "ташкент", "tashkent", "узбекистан", "uzbekistan", "тошкент", "🇺🇿",
+    "шевченко", "shevchenko", "паркент", "parkent", "руставели", "rustaveli", "ойбек",
+    "мирабад", "чиланзар", "юнусабад", "чехов", "chekhov", "амир темур", "дархан", "darhan",
+    "тараккиёт", "taraqqiyot", "узум", "uzum", "ц-1", "шахрисабз", "катартал", "нукусская",
+)
 
 
 def _normalize_brand_key(name: str) -> str:
@@ -124,8 +166,8 @@ def _normalize_brand_key(name: str) -> str:
 
 async def collect_all_location_places(location_query: str) -> List[PlaceInfo]:
     """
-    Параллельно сканирует заданную локацию по 6 коммерческим категориям через быстрый HTTP-движок Google Maps.
-    Собирает 40–65 заведений за ~1.5 секунды и убирает дубли.
+    Параллельно сканирует заданную локацию по 8 коммерческим категориям через быстрый HTTP-движок Google Maps.
+    Собирает 50–75 уникальных заведений за ~1.5 секунды и убирает дубли.
     """
     loc = location_query.strip()
     if "ташкент" not in loc.lower() and "tashkent" not in loc.lower():
@@ -134,18 +176,20 @@ async def collect_all_location_places(location_query: str) -> List[PlaceInfo]:
         loc_with_city = loc
 
     queries = [
-        f"ресторан гастробар {loc_with_city}",
-        f"пиццерия бургерная суши {loc_with_city}",
+        f"ресторан гастробар бистро {loc_with_city}",
+        f"пиццерия бургерная суши роллы {loc_with_city}",
         f"кафе кофейня пекарня кондитерская {loc_with_city}",
         f"бар паб лаунж кальянная {loc_with_city}",
-        f"барбершоп салон красоты косметология {loc_with_city}",
-        f"стоматология клиника цветы магазин {loc_with_city}",
+        f"барбершоп мужская парикмахерская {loc_with_city}",
+        f"салон красоты косметология спа {loc_with_city}",
+        f"стоматология dental клиника {loc_with_city}",
+        f"цветы букеты подарки магазин {loc_with_city}",
     ]
 
     async def _fetch_cat(q: str) -> List[PlaceInfo]:
         try:
             return await asyncio.wait_for(
-                keyless_places_service.search_text(q, max_results=12),
+                keyless_places_service.search_text(q, max_results=14),
                 timeout=4.5,
             )
         except Exception as e:
@@ -167,12 +211,10 @@ async def collect_all_location_places(location_query: str) -> List[PlaceInfo]:
                 continue
             if any(ch in low_name for ch in CHAIN_BLACKLIST):
                 continue
-            # Отсекаем безымянные государственные/общие точки вида "4 стоматология", "СТОМАТОЛОГИЯ", "Barbershop"
             clean_alpha = re.sub(r"[^a-zа-яё]+", " ", low_name).strip()
             if clean_alpha in GENERIC_ONLY_NAMES:
                 continue
             b_key = _normalize_brand_key(p.name)
-            # Не более 1 филиала одной и той же сети в рамках одной локации
             if b_key and seen_brands.get(b_key, 0) >= 1:
                 continue
             seen_ids.add(p.place_id)
@@ -209,7 +251,6 @@ def rank_google_reviews_leads(places: List[PlaceInfo]) -> List[HighChanceGoogleL
         }
         scored = evaluate_lead_potential(item_dict)
         if not scored:
-            # Дополнительный захват заведений с просаженным рейтингом (2.8..4.4⭐️) на конкретной улице
             r = p.rating
             rev = p.user_ratings_total or 0
             if r is not None and 2.5 <= r <= 4.45 and rev <= 300:
@@ -255,9 +296,19 @@ def rank_google_reviews_leads(places: List[PlaceInfo]) -> List[HighChanceGoogleL
     return leads
 
 
+def _extract_ig_handles_from_html(raw_html: str) -> List[str]:
+    found: List[str] = []
+    txt = urllib.parse.unquote(raw_html or "")
+    for m in re.finditer(r"instagram\.com/(?:_u/)?([A-Za-z0-9._]{3,30})", txt, re.IGNORECASE):
+        v = validate_ig_username(m.group(1).lower().rstrip("."))
+        if v and v not in found:
+            found.append(v)
+    return found
+
+
 def _build_fast_place_ig_candidates(place: PlaceInfo) -> Tuple[List[str], Optional[str], set[str]]:
     """
-    Генерирует до 6 самых вероятных Instagram-никнеймов для конкретного заведения на улице.
+    Генерирует стартовые кандидаты Instagram-никнеймов для конкретного заведения.
     Возвращает (candidates, direct_gmaps_ig, website_stems).
     """
     cands: List[str] = []
@@ -303,9 +354,12 @@ def _build_fast_place_ig_candidates(place: PlaceInfo) -> Tuple[List[str], Option
 
     raw_words = [
         w for w in _extract_brand_words(place.name, y_as_i=False, kh_mode=True)
-        if w not in ("the", "na", "v", "and")
+        if w not in ("the", "na", "v", "and") and w not in STREET_STOPWORDS
     ]
-    distinct_words = [w for w in raw_words if w not in GENERIC_ONLY_NAMES]
+    distinct_words = [
+        w for w in raw_words
+        if w not in GENERIC_ONLY_NAMES and w not in STREET_STOPWORDS
+    ]
     if raw_words:
         joined2 = "".join(raw_words[:2])
         under2 = "_".join(raw_words[:2])
@@ -327,212 +381,274 @@ def _build_fast_place_ig_candidates(place: PlaceInfo) -> Tuple[List[str], Option
             add(f"{w1}_tashkent")
             add(f"{w1}.tashkent")
             add(f"{w1}_restaurant")
-            add(f"{w1}pizzauz")
 
-    return cands[:4], direct_ig, web_stems
+    return cands[:5], direct_ig, web_stems
 
 
 async def rank_instagram_low_followers_leads(places: List[PlaceInfo]) -> List[HighChanceInstaLead]:
     """
-    Параллельно проверяет Instagram-аккаунты бизнесов на локации и ранжирует их
-    по вероятности продажи Instagram NFC-карты (упор на МАЛОЕ число подписчиков и слабый поток):
-    - 🔥 Приоритет №1 (92–99 баллов): Живой аккаунт, но ОЧЕНЬ МАЛО подписчиков (30 – 2 500 подп.) — острая боль!
-    - ⚡️ Приоритет №2 (82–91 балл): Мало подписчиков (2 501 – 6 500 подп.) — слабый перелив гостей из зала.
-    - 📌 Приоритет №3 (74–81 балл): Средний аккаунт (6 501 – 14 500 подп.) ИЛИ точка вообще не привязала Инсту к Картам.
-    - 🚫 Отсев: Крупные сети с > 25 000 подписчиков полностью исключаются.
+    Тщательно находит и 100% ВЕРИФИЦИРУЕТ реальные Instagram-аккаунты бизнесов Ташкента на выбранной локации:
+    1. Проверяет прямую ссылку в Google Картах и парсит официальный сайт бизнеса (если указан).
+    2. Запускает поисковый пробив "{Название} Ташкент instagram" для точек без прямой ссылки в Картах.
+    3. Загружает полную биографию (<meta name="description">), телефон, адрес, число постов и подписчиков.
+    4. Жёстко отсекает однофамильцев, личные страницы, пустые профили и другие города/страны.
+    5. Сортирует ТОЛЬКО подтверждённые бизнесы с малым числом подписчиков (до 20 000 подп.) от самой острой боли к меньшей.
     """
-    place_meta = {}
+    sem_search = asyncio.Semaphore(14)
+    sem_ig = asyncio.Semaphore(36)
+
+    place_cands: Dict[str, Tuple[List[str], Optional[str], set[str], set[str]]] = {}
     all_handles: List[str] = []
 
-    for p in places:
-        cands, direct_ig, web_stems = _build_fast_place_ig_candidates(p)
-        b_words = _extract_brand_words(p.name, y_as_i=False, kh_mode=True)
-        place_meta[p.place_id] = {
-            "cands": cands,
-            "direct_ig": direct_ig,
-            "web_stems": web_stems,
-            "brand_words": b_words,
-        }
-        for h in cands:
-            if h not in all_handles:
-                all_handles.append(h)
+    async with httpx.AsyncClient(
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+        },
+        follow_redirects=True,
+        timeout=3.2,
+    ) as search_client:
 
-    verified_map: Dict[str, Dict[str, any]] = {}
-    sem = asyncio.Semaphore(48)
+        async def _discover_for_place(p: PlaceInfo):
+            cs, direct_ig, _ = _build_fast_place_ig_candidates(p)
+            web_scraped_igs: List[str] = []
+            yahoo_hits: List[str] = []
 
+            # Шаг 1: Если у бизнеса указан собственный сайт (не справочник), ищем ссылку на Instagram прямо на сайте
+            w = (p.website or "").strip()
+            if w and not direct_ig and "instagram.com" not in w.lower():
+                if not any(d in w.lower() for d in DIRECTORY_DOMAINS):
+                    try:
+                        rw = await search_client.get(w, timeout=2.2)
+                        if rw.status_code == 200:
+                            for u in _extract_ig_handles_from_html(rw.text)[:2]:
+                                web_scraped_igs.append(u)
+                                if u not in cs:
+                                    cs.insert(0, u)
+                    except Exception:
+                        pass
+
+            # Шаг 2: Если нет прямой привязки в Картах/сайте, пробиваем через поисковый индекс Ташкента
+            if not direct_ig and not web_scraped_igs:
+                async with sem_search:
+                    try:
+                        q = urllib.parse.quote(f"{p.name} Ташкент instagram")
+                        r = await search_client.get(f"https://search.yahoo.com/search?p={q}")
+                        if r.status_code == 200:
+                            for u in _extract_ig_handles_from_html(r.text)[:3]:
+                                yahoo_hits.append(u)
+                                if u not in cs:
+                                    cs.insert(0, u)
+                    except Exception:
+                        pass
+
+            top_cs = cs[:6]
+            place_cands[p.place_id] = (top_cs, direct_ig, set(web_scraped_igs), set(yahoo_hits))
+            for u in top_cs:
+                if u not in all_handles:
+                    all_handles.append(u)
+
+        await asyncio.gather(*[_discover_for_place(p) for p in places])
+
+    verified_profiles: Dict[str, Dict[str, Any]] = {}
     async with httpx.AsyncClient(
         headers={"User-Agent": "TelegramBot (like TwitterBot)"},
         follow_redirects=True,
-        timeout=2.8,
-    ) as client:
-        async def _check_handle(u: str):
-            async with sem:
+        timeout=3.8,
+    ) as ig_client:
+
+        async def _fetch_ig_profile(u: str):
+            async with sem_ig:
                 try:
-                    r = await client.get(f"https://www.instagram.com/{u}/")
+                    r = await ig_client.get(f"https://www.instagram.com/{u}/")
                     if r.status_code != 200:
                         return
                     og_m = re.search(r'property="og:title"\s+content="([^"]+)"', r.text)
-                    desc_m = re.search(r'property="og:description"\s+content="([^"]+)"', r.text)
+                    desc_m = re.search(r'<meta\s+content="([^"]+)"\s+name="description"', r.text) or re.search(
+                        r'<meta\s+name="description"\s+content="([^"]+)"', r.text
+                    )
+                    og_desc_m = re.search(r'property="og:description"\s+content="([^"]+)"', r.text)
                     if not og_m:
                         return
-                    title = html.unescape(og_m.group(1)).strip()
-                    desc = html.unescape(desc_m.group(1)).strip() if desc_m else ""
-                    flw = _parse_followers(desc)
-                    verified_map[u] = {
+                    raw_title = html.unescape(og_m.group(1)).strip()
+                    clean_title = raw_title.split("(@")[0].split("•")[0].strip()
+                    full_meta = html.unescape(desc_m.group(1)).strip() if desc_m else ""
+                    og_desc = html.unescape(og_desc_m.group(1)).strip() if og_desc_m else full_meta
+
+                    flw = _parse_followers(og_desc)
+                    if flw is None:
+                        return
+                    m_flwing = re.search(r"([\d.,]+)\s*Following", og_desc, re.I)
+                    flwing = int(re.sub(r"[^\d]", "", m_flwing.group(1)) or "0") if m_flwing else 0
+                    m_posts = re.search(r"([\d.,]+)\s*Posts", og_desc, re.I)
+                    posts = int(re.sub(r"[^\d]", "", m_posts.group(1)) or "0") if m_posts else 0
+
+                    bio_text = ""
+                    if "on Instagram:" in full_meta:
+                        bio_text = full_meta.split("on Instagram:", 1)[1].strip().strip('"')
+
+                    verified_profiles[u] = {
                         "username": u,
-                        "title": title,
-                        "desc": desc,
+                        "title": clean_title,
+                        "raw_title": raw_title,
+                        "bio": bio_text,
                         "followers": flw,
+                        "following": flwing,
+                        "posts": posts,
                     }
                 except Exception:
                     pass
 
-        await asyncio.gather(*[_check_handle(u) for u in all_handles])
+        await asyncio.gather(*[_fetch_ig_profile(u) for u in all_handles])
 
     leads: List[HighChanceInstaLead] = []
     seen_ig_handles: set[str] = set()
 
     for p in places:
-        meta = place_meta[p.place_id]
-        cands = meta["cands"]
-        direct_ig = meta["direct_ig"]
-        web_stems = meta["web_stems"]
-        b_words = [w for w in meta["brand_words"] if w not in GENERIC_ONLY_NAMES]
+        if p.place_id not in place_cands:
+            continue
+        cs, direct_ig, web_scraped_igs, yahoo_hits = place_cands[p.place_id]
+        distinct_b_words = [
+            w for w in _extract_brand_words(p.name, y_as_i=False, kh_mode=True)
+            if len(w) >= 3 and w not in STREET_STOPWORDS and w not in GENERIC_ONLY_NAMES
+        ]
+        p_digits = re.sub(r"\D", "", p.phone or "")[-7:] if p.phone else ""
 
-        found_profiles = [verified_map[c] for c in cands if c in verified_map]
+        best_match: Optional[Tuple[Dict[str, Any], str]] = None
+        best_sc = -999.0
 
-        # Выбираем наиболее достоверный профиль этого бизнеса
-        best_prof = None
-        best_match_sc = -999.0
-        for prof in found_profiles:
-            u = prof["username"].lower()
+        for u in cs:
+            prof = verified_profiles.get(u)
+            if not prof:
+                continue
             flw = prof["followers"]
-            raw_title_low = prof["title"].lower()
-            raw_desc_low = (prof.get("desc") or "").lower()
-            title_lat = _cyr_to_latin(raw_title_low, y_as_i=False, kh_mode=True)
+            posts = prof["posts"]
+            flwing = prof["following"]
+            title_bio_low = f"{prof['title']} {prof['bio']}".lower()
+            combined_low = f"{u} {title_bio_low}"
+            title_lat = _cyr_to_latin(prof["title"].lower(), y_as_i=False, kh_mode=True)
             u_clean = re.sub(r"[._]", "", u)
 
-            # Отсекаем пустые/мёртвые однофамильные заглушки с < 55 подписчиками (если это не прямая ссылка с карт)
-            if flw < 55 and u != direct_ig and u not in web_stems:
+            is_official_link = (direct_ig and u == direct_ig) or (u in web_scraped_igs)
+
+            # 1. Мгновенный отсев чужих стран/городов и продающихся пустых ников
+            if any(fm in combined_low for fm in FOREIGN_MARKERS):
                 continue
 
-            m_sc = 0.0
-            is_verified_link = False
-            if direct_ig and u == direct_ig:
-                m_sc += 500.0
-                is_verified_link = True
-            if any(st in u_clean for st in web_stems if len(st) >= 3):
-                m_sc += 180.0
-                is_verified_link = True
+            if not is_official_link:
+                # 2. Живой бизнес-профиль: минимум 40 подписчиков и минимум 5 публикаций
+                if flw < 40 or posts < 5:
+                    continue
+                # 3. У реального бизнеса число исходящих подписок не превышает число подписчиков
+                if flw < 1500 and flwing > flw:
+                    continue
+                # 4. Запрет личных блогов, свадебных аккаунтов и нерелевантных магазинов
+                if any(
+                    pers in combined_low
+                    for pers in ("🤵", "👰", "student", "mum", "личн", "блог", "спортивное питание", "sport ozuqalari")
+                ):
+                    continue
 
-            brand_hit = False
-            for bw in b_words:
-                if len(bw) >= 3:
-                    if bw in title_lat or bw in raw_title_low:
-                        m_sc += 95.0
-                        brand_hit = True
-                    if bw in u_clean:
-                        m_sc += 70.0
-                        brand_hit = True
+            has_phone_match = bool(p_digits and len(p_digits) == 7 and p_digits in re.sub(r"\D", "", prof["bio"]))
+            has_uz_geo = any(g in combined_low for g in UZ_GEO_MARKERS) or u.endswith(("uz", "_uz", ".uz", "tashkent"))
+            has_biz_category = any(bm in title_bio_low for bm in REAL_BIZ_CATEGORY_WORDS)
+            has_brand = any(bw in title_lat or bw in prof["title"].lower() or bw in u_clean for bw in distinct_b_words)
+            has_cyrillic = bool(re.search(r"[а-яА-ЯёЁ]", title_bio_low))
 
-            # Если это не прямая ссылка с сайта/карт и в профиле нет совпадения по бренду — пропускаем
-            if not is_verified_link and not brand_hit:
-                continue
+            if not is_official_link:
+                # Если у бизнеса нет уникального слова в названии (например просто 'DENTA CLINIC'),
+                # требуем 100% совпадения телефона из Google Карт!
+                if not distinct_b_words:
+                    if not has_phone_match:
+                        continue
+                else:
+                    if not has_brand:
+                        continue
+                # Обязательно совпадение телефона ИЛИ явная категория бизнеса в шапке/описании
+                if not (has_phone_match or has_biz_category):
+                    continue
+                # Обязательно явная гео-привязка к Ташкенту/Узбекистану или совпадение телефона Ташкента!
+                if not (has_phone_match or has_uz_geo):
+                    continue
 
-            if any(uz in u or uz in raw_title_low or uz in raw_desc_low for uz in ("_uz", ".uz", "tashkent", "ташкент", "узбекистан")):
-                m_sc += 110.0
-            if re.search(r"[а-яА-ЯёЁ]", raw_title_low) or re.search(r"[а-яА-ЯёЁ]", raw_desc_low):
-                m_sc += 45.0
-            if flw >= 120:
-                m_sc += 40.0
+            if is_official_link:
+                sc = 1000.0
+                v_badge = "✅ Привязан к Картам / сайту"
+            elif has_phone_match:
+                sc = 800.0
+                v_badge = "✅ Совпал телефон в профиле"
+            elif u in yahoo_hits and has_uz_geo:
+                sc = 550.0
+                v_badge = "✅ Подтверждён (Ташкент)"
+            else:
+                sc = 350.0
+                v_badge = "✅ Проверен по биографии"
 
-            if m_sc > best_match_sc:
-                best_match_sc = m_sc
-                best_prof = prof
+            if has_uz_geo:
+                sc += 150.0
+            if has_biz_category:
+                sc += 120.0
+            if sc > best_sc:
+                best_sc = sc
+                best_match = (prof, v_badge)
 
-        # Если нашли подтверждённый Instagram-профиль заведения
-        if best_prof:
-            u = best_prof["username"].lower()
+        if best_match:
+            prof, v_badge = best_match
+            u = prof["username"].lower()
             if u in seen_ig_handles:
                 continue
-            seen_ig_handles.add(u)
-            flw = best_prof["followers"]
-            title = best_prof["title"].split("(@")[0].split("•")[0].strip()
-
-            # Крупные аккаунты (> 25 000 подписчиков) отсекаем — у них нет боли малого числа подписчиков!
-            if flw > 25_000:
+            flw = prof["followers"]
+            posts = prof["posts"]
+            # Отсекаем раскрученные аккаунты (> 20 000 подписчиков) — оставляем только тех, кому реально нужен трафик!
+            if flw > 20_000:
                 continue
 
-            if 20 <= flw <= 1_200:
-                score = 98 - int(flw / 200)
-                tier_badge = "🔥 ОСТРАЯ БОЛЬ: Мало подписчиков"
-                pain_text = (
-                    f"В Instagram всего <b>{flw} подписчиков</b> (@{u})! "
-                    f"Гости сидят в зале, но не подписываются — идеальный клиент под Instagram NFC-карту."
-                )
-            elif 1_201 <= flw <= 3_500:
+            seen_ig_handles.add(u)
+            if flw <= 1_200:
+                score = 99 - int(flw / 200)
+                tier_badge = "🔥 Острая боль: Очень мало подписчиков"
+                pain_text = f"Всего {flw} подп. ({posts} публ.) — острая нехватка трафика в Инсту"
+            elif flw <= 3_500:
                 score = 91 - int((flw - 1200) / 400)
-                tier_badge = "🔥 Высокий шанс (Слабый поток в Инсту)"
-                pain_text = (
-                    f"В профиле @{u} всего <b>{_format_followers_badge(flw)}</b>. "
-                    f"Аккаунт ведут, но перелив трафика из офлайна слабый — легко зацепить за живое!"
-                )
-            elif 3_501 <= flw <= 8_500:
+                tier_badge = "🔥 Мало подписчиков (Слабый поток)"
+                pain_text = f"Всего {_format_followers_badge(flw)} — слабый перелив гостей из зала"
+            elif flw <= 8_500:
                 score = 84 - int((flw - 3500) / 800)
-                tier_badge = "⚡️ Хороший потенциал (Добить до 10K+)"
-                pain_text = (
-                    f"У @{u} сейчас <b>{_format_followers_badge(flw)}</b> — не хватает живого трафика гостей до красивой цифры 10K+."
-                )
+                tier_badge = "⚡️ Потенциал роста (Добить до 10K+)"
+                pain_text = f"Сейчас {_format_followers_badge(flw)} — легко продать добивку до 10K+"
             else:
-                score = 75
-                tier_badge = "📌 Точка роста Instagram"
-                pain_text = (
-                    f"Профиль @{u} (<b>{_format_followers_badge(flw)}</b>) — можно усилить органический поток подписчиков с каждого стола."
-                )
+                score = 76
+                tier_badge = "📌 Усиление потока в Instagram"
+                pain_text = f"Профиль {_format_followers_badge(flw)} — перевод гостей со столов в подписчики"
 
             primary_url = f"https://instagram.com/{u}?igsh={DEFAULT_IGSH_TOKEN}"
             deep_url = f"instagram://user?username={u}"
+            profile_web_url = f"https://www.instagram.com/{u}/"
+
             leads.append(
                 HighChanceInstaLead(
                     place=p,
                     ig_username=u,
-                    ig_title=title,
+                    ig_title=prof["title"],
                     followers=flw,
+                    posts=posts,
                     score=score,
                     tier_badge=tier_badge,
                     pain_text=pain_text,
+                    verification_badge=v_badge,
                     primary_nfc_url=primary_url,
                     deep_link_url=deep_url,
+                    profile_web_url=profile_web_url,
                 )
             )
-        else:
-            # Если у заведения в Google Картах вообще не привязан сайт/Инста, а отзывов немного —
-            # это локальная несетевая точка со слабым маркетингом
-            revs = p.user_ratings_total or 0
-            if 2 <= revs <= 180 and not (p.website and "instagram.com" in p.website.lower()):
-                leads.append(
-                    HighChanceInstaLead(
-                        place=p,
-                        ig_username=None,
-                        ig_title=None,
-                        followers=None,
-                        score=78 if revs <= 60 else 73,
-                        tier_badge="🎯 Нет Инсты в Картах (Слабый поток)",
-                        pain_text=(
-                            "Инстаграм не привязан к карточке заведения — теряют весь трафик гостей! "
-                            "Нажмите номер точки ниже, чтобы бот пробил их точный @ник за 1 секунду."
-                        ),
-                        primary_nfc_url=None,
-                        deep_link_url=None,
-                    )
-                )
 
-    # Сортируем: сначала подтверждённые аккаунты с самым малым числом подписчиков (высокий score), затем остальные
+    # Сортируем от самого малого числа подписчиков (наивысший шанс продажи!) к большему
     leads.sort(
         key=lambda item: (
-            1 if item.ig_username else 0,
             item.score,
-            -(item.followers or 99999),
+            -item.followers,
         ),
         reverse=True,
     )

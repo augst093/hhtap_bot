@@ -320,25 +320,23 @@ def format_instagram_card(data: InstagramCardData, searched_query: Optional[str]
     u = html.escape(data.clean_username)
     primary = html.escape(data.primary_nfc_url)
     deep = html.escape(data.deep_link_url)
+    web_link = f"https://www.instagram.com/{u}/"
 
     header_extra = ""
     if searched_query:
-        header_extra += f"🔎 <b>Запрос:</b> {html.escape(searched_query)}\n"
+        header_extra += f"🔎 <b>Бизнес:</b> {html.escape(searched_query)}\n"
     if data.profile_title or data.followers_count:
         clean_title = (data.profile_title or "").split("(@")[0].split("•")[0].strip()
         flw_str = _format_followers_badge(data.followers_count)
         parts = [p for p in (html.escape(clean_title) if clean_title else "", flw_str) if p]
         if parts:
             header_extra += f"✅ <b>Профиль:</b> {' • '.join(parts)}\n"
-    if header_extra:
-        header_extra += "\n"
 
     return (
-        f"📸 <b>Instagram NFC карта для: @{u}</b>\n"
-        f"{header_extra}"
-        f"🔗 <b>Основная ссылка (рекомендуется для NFC Tools):</b>\n"
-        f"<code>{primary}</code>\n"
-        f"<i>(Нажми на ссылку выше, чтобы скопировать без пробелов)</i>\n\n"
+        f"📸 <b>Instagram NFC: @{u}</b> — <a href=\"{web_link}\">Перейти на аккаунт ↗️</a>\n"
+        f"{header_extra}\n"
+        f"🔗 <b>Основная ссылка для NFC Tools (нажми, чтобы скопировать):</b>\n"
+        f"<code>{primary}</code>\n\n"
         f"⚡️ <b>Прямой Deep Link (альтернатива):</b>\n"
         f"<code>{deep}</code>"
     )

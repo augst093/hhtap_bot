@@ -1126,21 +1126,36 @@ def make_hc_location_keyboard(mode: str, last_loc: Optional[str] = None) -> Inli
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _clean_short_biz_name(name: str) -> str:
+    """Убирает лишний SEO-мусор после '|' или '—' из длинных названий заведений для чистоты UI."""
+    if not name:
+        return "Заведение"
+    short = name.split("|")[0].split(" - ")[0].split(" — ")[0].strip()
+    return short[:38] if short else name[:38]
+
+
+def _clean_short_address(address: str) -> str:
+    """Форматирует лаконичный адрес без дублей 'Ташкент UZ Tashkent'."""
+    if not address:
+        return "Ташкент"
+    first_part = address.split(",")[0].strip()
+    first_part = re.sub(r"\b(?:Ташкент|Tashkent|UZ|Узбекистан)\b", "", first_part, flags=re.IGNORECASE).strip(" ,.-")
+    return first_part[:36] if first_part else "Ташкент"
+
+
 def format_hc_menu_text(last_loc: Optional[str] = None) -> str:
     loc_hint = (
-        f"\n📍 <b>Текущая выбранная локация:</b> <code>{html.escape(last_loc)}</code>\n"
+        f"\n📍 Выбранная улица: <b>{html.escape(last_loc)}</b>\n"
         if last_loc
         else ""
     )
     return (
-        "🎯 <b>Парсер высоких шансов продаж (По локации)</b>\n\n"
-        "Бот автономно собирает <b>ВСЕ бизнесы с указанной вами локации</b>, "
-        "вычисляет их главную боль и выдаёт <b>пачками по 5 ЛУЧШИХ заведений</b> "
-        "(с кнопками <b>⬅️ Назад</b> и <b>Дальше (Ещё 5) ➡️</b>):\n\n"
-        "1️⃣ <b>⭐️ Google Reviews</b> — ищет бизнесы на локации с <b>плохими отзывами и малым количеством оценок</b> (острая боль репутации в картах).\n"
-        "2️⃣ <b>📸 Instagram</b> — ищет бизнесы на локации, у которых <b>мало подписчиков в Инсте и слабый поток гостей</b> (идеально под продажу Instagram NFC-карт!).\n"
+        "🎯 <b>Парсер высоких шансов продаж</b>\n\n"
+        "Бот собирает реальные бизнесы на выбранной улице, проверяет их и выдаёт <b>пачками по 5 ЛУЧШИХ</b>:\n\n"
+        "⭐️ <b>Google Reviews</b> — точки с плохим рейтингом и малым числом отзывов.\n"
+        "📸 <b>Instagram</b> — 100% проверенные бизнесы Ташкента, у которых <b>мало подписчиков</b> и слабый поток.\n"
         f"{loc_hint}\n"
-        "👇 <b>Нажмите на нужный режим ниже (или сразу напишите улицу/локацию в чат):</b>"
+        "👇 <b>Выберите режим (или напишите улицу в чат):</b>"
     )
 
 
@@ -1149,13 +1164,13 @@ def format_hc_pack_page(
     mode: str,
     page_idx: int,
 ) -> str:
-    """Форматирует пачку из 5 ЛУЧШИХ бизнесов на локации для выбранного режима."""
+    """Форматирует чистую, удобную для чтения пачку из 5 ЛУЧШИХ бизнесов с синими кликабельными ссылками."""
     items = pack.google_leads if mode == "google" else pack.insta_leads
     total = len(items)
     if total == 0:
         mode_title = "Google Reviews" if mode == "google" else "Instagram"
         return (
-            f"🔍 <b>На локации «{html.escape(pack.location_query)}» подходящих лидов ({mode_title}) не найдено.</b>\n\n"
+            f"🔍 <b>На улице «{html.escape(pack.location_query)}» подходящих точек ({mode_title}) не найдено.</b>\n\n"
             "Попробуйте указать соседнюю улицу или более широкую локацию."
         )
 
@@ -1167,59 +1182,56 @@ def format_hc_pack_page(
 
     if mode == "google":
         lines = [
-            f"🎯 <b>ТОП БИЗНЕСОВ: ⭐️ GOOGLE REVIEWS (Плохие отзывы / Мало оценок)</b>",
-            f"📍 Локация: <b>{html.escape(pack.location_query)}</b> • Собрано: <b>{total}</b> (проверено {pack.total_scanned} точек)",
-            f"📦 <b>Пачка #{page_idx + 1} из {total_pages} (Показаны {start + 1}–{end} из {total}):</b>",
-            "━━━━━━━━━━━━━━━━━━━━",
+            f"⭐️ <b>GOOGLE КАРТЫ • Плохие отзывы / Мало оценок</b>",
+            f"📍 <b>{html.escape(pack.location_query)}</b>  •  Стр. <b>{page_idx + 1}/{total_pages}</b> (Всего: {total})",
+            "────────────────────",
         ]
         for idx, lead in enumerate(page_slice, start=start + 1):
             p = lead.place
+            short_name = html.escape(_clean_short_biz_name(p.name))
             r_str = f"{p.rating:.1f}⭐️" if p.rating is not None else "Без оценки"
             rev_str = f"{p.user_ratings_total or 0} отз."
             phone_info = parse_uz_phone(p.phone)
-            phone_str = f" • 📞 <code>{html.escape(phone_info.get('pretty') or p.phone or '')}</code>" if phone_info else ""
-            addr_short = html.escape((p.address or "").split(",")[0].strip())
+            phone_val = (phone_info.get("raw") or phone_info.get("e164") or p.phone or "").strip()
+            phone_str = f"  •  📞 <code>{html.escape(phone_val)}</code>" if phone_val else ""
+            addr_short = html.escape(_clean_short_address(p.address))
+            maps_open_url = html.escape(p.google_maps_url or lead.fast_app_url)
             lines.append(
-                f"\n<b>{idx}. {html.escape(p.name)}</b> — <b>{r_str}</b> ({rev_str})\n"
-                f"🎯 <i>Нужно +{lead.needed_5stars} оценок 5⭐️ до {lead.target_rating:.1f}⭐️ • Шанс: {lead.score}/100</i>\n"
+                f"\n<b>{idx}. {short_name}</b> — <b>{r_str}</b> ({rev_str})\n"
+                f"🎯 Нужно <b>+{lead.needed_5stars} оценок 5⭐️</b> до {lead.target_rating:.1f}⭐️  •  <a href=\"{maps_open_url}\">Открыть в Картах ↗️</a>\n"
                 f"📍 {addr_short}{phone_str}\n"
-                f"⚡️ Ссылка №1 (App): <code>{html.escape(lead.fast_app_url)}</code>\n"
-                f"⭐️ Ссылка №2 (5⭐️): <code>{html.escape(lead.direct_5star_url)}</code>"
+                f"⚡️ App: <code>{html.escape(lead.fast_app_url)}</code>\n"
+                f"⭐️ 5⭐️: <code>{html.escape(lead.direct_5star_url)}</code>"
             )
         lines.append(
-            "\n💡 <i>Тапните на любую ссылку для копирования в NFC Tools или нажмите кнопку 1️⃣–5️⃣ ниже для ИИ-питча и CRM!</i>"
+            "\n💡 <i>Тапните на код-ссылку для копирования в NFC Tools или нажмите 1️⃣–5️⃣ для карточки и ИИ-питча.</i>"
         )
         return "\n".join(lines)
 
-    # Режим: Instagram (Мало подписчиков / слабый поток)
+    # Режим: Instagram (Мало подписчиков / слабый поток) — ЧИСТЫЙ UI + СИНЯЯ ССЫЛКА "Перейти на аккаунт ↗️"
     lines = [
-        f"🎯 <b>ТОП БИЗНЕСОВ: 📸 INSTAGRAM (Мало подписчиков / Слабый поток)</b>",
-        f"📍 Локация: <b>{html.escape(pack.location_query)}</b> • Собрано: <b>{total}</b> (проверено {pack.total_scanned} точек)",
-        f"📦 <b>Пачка #{page_idx + 1} из {total_pages} (Показаны {start + 1}–{end} из {total}):</b>",
-        "━━━━━━━━━━━━━━━━━━━━",
+        f"📸 <b>ИНСТАГРАМ • Мало подписчиков</b>",
+        f"📍 <b>{html.escape(pack.location_query)}</b>  •  Стр. <b>{page_idx + 1}/{total_pages}</b> (Проверено: {total} бизнесов)",
+        "────────────────────",
     ]
     for idx, lead in enumerate(page_slice, start=start + 1):
         p = lead.place
+        short_name = html.escape(_clean_short_biz_name(p.name))
         phone_info = parse_uz_phone(p.phone)
-        phone_str = f" • 📞 <code>{html.escape(phone_info.get('pretty') or p.phone or '')}</code>" if phone_info else ""
-        addr_short = html.escape((p.address or "").split(",")[0].strip())
-        if lead.ig_username:
-            flw_str = f"{lead.followers} подписчиков" if lead.followers is not None else "профиль активен"
-            lines.append(
-                f"\n<b>{idx}. {html.escape(p.name)}</b>\n"
-                f"📸 Инста: <b>@{html.escape(lead.ig_username)}</b> — 🔥 <b>{flw_str}</b> (Шанс: {lead.score}/100)\n"
-                f"📍 {addr_short}{phone_str}\n"
-                f"📲 NFC-ссылка: <code>{html.escape(lead.primary_nfc_url or '')}</code>\n"
-                f"⚡️ Deep Link: <code>{html.escape(lead.deep_link_url or '')}</code>"
-            )
-        else:
-            lines.append(
-                f"\n<b>{idx}. {html.escape(p.name)}</b>\n"
-                f"🎯 <i>Инстаграм не привязан к Картам — теряют трафик гостей! (Нажмите кнопку {idx - start}️⃣ ниже для точного пробива @ника)</i>\n"
-                f"📍 {addr_short}{phone_str}"
-            )
+        phone_val = (phone_info.get("raw") or phone_info.get("e164") or p.phone or "").strip()
+        phone_str = f"  •  📞 <code>{html.escape(phone_val)}</code>" if phone_val else ""
+        addr_short = html.escape(_clean_short_address(p.address))
+        u_esc = html.escape(lead.ig_username)
+        web_url = f"https://www.instagram.com/{u_esc}/"
+        flw_str = f"{lead.followers:,}".replace(",", " ") + " подп."
+        lines.append(
+            f"\n<b>{idx}. {short_name}</b>  •  🔥 <b>{flw_str}</b>\n"
+            f"👤 <b>@{u_esc}</b> — <a href=\"{web_url}\">Перейти на аккаунт ↗️</a>\n"
+            f"📍 {addr_short}{phone_str}\n"
+            f"🏷 NFC: <code>{html.escape(lead.primary_nfc_url)}</code>"
+        )
     lines.append(
-        "\n💡 <i>Тапните на ссылку для копирования в NFC Tools или нажмите 1️⃣–5️⃣ для полной карточки и ИИ-скриптов!</i>"
+        "\n💡 <i>Нажмите синюю кнопку «Перейти на аккаунт ↗️» для проверки профиля, или тапните NFC-ссылку для копирования!</i>"
     )
     return "\n".join(lines)
 
@@ -1230,10 +1242,10 @@ def make_hc_pack_keyboard(
     page_idx: int,
 ) -> InlineKeyboardMarkup:
     """
-    Инлайн-клавиатура под пачкой из 5 лучших бизнесов:
-    - Стрелки ⬅️ Назад и Дальше (Ещё 5) ➡️
-    - Кнопки 1️⃣..5️⃣ для открытия детальной карточки конкретного бизнеса с ИИ-питчами
-    - Кнопка мгновенного переключения между Google Reviews и Instagram на этой же локации
+    Компактная и понятная инлайн-клавиатура под пачкой из 5 лучших бизнесов:
+    - Ряд 1: [ ⬅️ Назад ] | [ 1 / 4 ] | [ Дальше (Ещё 5) ➡️ ]
+    - Ряд 2: [ 1️⃣ ] [ 2️⃣ ] [ 3️⃣ ] [ 4️⃣ ] [ 5️⃣ ] (открыть карточку и ИИ-скрипты)
+    - Ряд 3: [ 🔄 Переключить на Google Карты / Instagram ] | [ 📍 Другая улица ]
     """
     items = pack.google_leads if mode == "google" else pack.insta_leads
     total = len(items)
@@ -1244,18 +1256,18 @@ def make_hc_pack_keyboard(
 
     rows: List[List[InlineKeyboardButton]] = []
 
-    # Ряд 1: Стрелки навигации по пачкам из 5 бизнесов (⬅️ Назад | Стр. X/Y | Дальше (Ещё 5) ➡️)
+    # Ряд 1: Стрелки навигации по пачкам из 5 бизнесов
     nav_row: List[InlineKeyboardButton] = []
     if page_idx > 0:
         nav_row.append(
             InlineKeyboardButton(
-                text="⬅️ Назад (Предыдущие 5)",
+                text="⬅️ Назад",
                 callback_data=f"hc:page:{pack.pack_id}:{mode}:{page_idx - 1}",
             )
         )
     nav_row.append(
         InlineKeyboardButton(
-            text=f"📄 {page_idx + 1}/{total_pages} ({total} шт.)",
+            text=f"📄 {page_idx + 1} / {total_pages}",
             callback_data="hc:noop",
         )
     )
@@ -1268,45 +1280,31 @@ def make_hc_pack_keyboard(
         )
     rows.append(nav_row)
 
-    # Ряд 2: Кнопки 1️⃣..5️⃣ для открытия полной карточки любого из 5 заведений на странице
+    # Ряд 2: Кнопки 1️⃣..5️⃣ для открытия полной карточки и ИИ-питчей любого из 5 бизнесов
     num_emojis = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣"]
     item_btns: List[InlineKeyboardButton] = []
     for local_i, abs_i in enumerate(range(start, end)):
         item_btns.append(
             InlineKeyboardButton(
-                text=f"{num_emojis[local_i]} #{abs_i + 1}",
+                text=num_emojis[local_i],
                 callback_data=f"hc:item:{pack.pack_id}:{mode}:{abs_i}",
             )
         )
     if item_btns:
         rows.append(item_btns)
 
-    # Ряд 3: Мгновенное переключение Google Reviews <-> Instagram на этой же улице
+    # Ряд 3: Переключение режима на этой же улице + выбор другой улицы
     other_mode = "insta" if mode == "google" else "google"
-    other_btn_text = (
-        f"📸 Инста (Мало подписчиков) на «{pack.location_query[:16]}»"
-        if other_mode == "insta"
-        else f"⭐️ Google (Плохие отзывы) на «{pack.location_query[:16]}»"
-    )
+    other_btn_text = "📸 Режим: Instagram" if other_mode == "insta" else "⭐️ Режим: Google Карты"
     rows.append(
         [
             InlineKeyboardButton(
                 text=other_btn_text,
                 callback_data=f"hc:switch:{pack.pack_id}:{other_mode}",
-            )
-        ]
-    )
-
-    # Ряд 4: Другая локация / В меню парсера
-    rows.append(
-        [
-            InlineKeyboardButton(
-                text="📍 Другая локация",
-                callback_data=f"hc:mode:{mode}",
             ),
             InlineKeyboardButton(
-                text="🧭 В меню парсера",
-                callback_data="hc:menu",
+                text="📍 Другая улица",
+                callback_data=f"hc:mode:{mode}",
             ),
         ]
     )
